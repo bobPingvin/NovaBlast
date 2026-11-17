@@ -1,0 +1,156 @@
+{
+  "entities": {
+    "Project": {
+      "title": "Project",
+      "description": "A pixel art project saved by the user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The unique identifier for the project."
+        },
+        "name": {
+          "type": "string",
+          "description": "The name of the project."
+        },
+        "grid": {
+          "type": "string",
+          "description": "The serialized grid data (JSON string)."
+        },
+        "frames": {
+          "type": "array",
+          "description": "Serialized array of frame grid states for animations."
+        },
+        "fps": {
+          "type": "integer",
+          "description": "Animation frames per second."
+        },
+        "projectType": {
+          "type": "string",
+          "enum": ["static", "animated"],
+          "description": "Type of project."
+        },
+        "width": {
+          "type": "integer",
+          "description": "The width of the canvas."
+        },
+        "height": {
+          "type": "integer",
+          "description": "The height of the canvas."
+        },
+        "userId": {
+          "type": "string",
+          "description": "The ID of the user who owns the project."
+        },
+        "ownerName": {
+          "type": "string",
+          "description": "The display name of the owner."
+        },
+        "ownerEmail": {
+          "type": "string",
+          "description": "The email address of the owner."
+        },
+        "previewImage": {
+          "type": "string",
+          "description": "Base64 data URL preview of the project."
+        },
+        "customColors": {
+          "type": "array",
+          "description": "User custom colors history for this project."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The timestamp when the project was last updated."
+        }
+      },
+      "required": ["name", "grid", "width", "height", "userId", "updatedAt"]
+    },
+    "HotkeyConfig": {
+      "title": "HotkeyConfig",
+      "description": "User custom hotkey settings.",
+      "type": "object",
+      "properties": {
+        "undo": { "type": "object", "description": "Undo hotkey" },
+        "redo": { "type": "object", "description": "Redo hotkey" },
+        "pen": { "type": "object", "description": "Pen tool hotkey" },
+        "eraser": { "type": "object", "description": "Eraser tool hotkey" },
+        "fill": { "type": "object", "description": "Fill tool hotkey" },
+        "picker": { "type": "object", "description": "Picker tool hotkey" },
+        "gradient": { "type": "object", "description": "Gradient tool hotkey" },
+        "toggleGrid": { "type": "object", "description": "Toggle grid hotkey" },
+        "brushResize": { "type": "object", "description": "Brush resize hotkey" },
+        "playAnimation": { "type": "object", "description": "Play or pause animation hotkey" },
+        "line": { "type": "object", "description": "Line tool hotkey" },
+        "ruler": { "type": "object", "description": "Ruler tool hotkey" },
+        "mirror": { "type": "object", "description": "Mirror / Symmetry tool hotkey" }
+      }
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account profile supporting Email, Google, and Steam OpenID authentication.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID (e.g. steam_<steamId64>)." },
+        "nickname": { "type": "string", "description": "Display nickname or Steam persona name." },
+        "email": { "type": "string", "description": "Optional email address." },
+        "steamId": { "type": "string", "description": "64-bit SteamID when authenticated via Steam." },
+        "photoURL": { "type": "string", "description": "Avatar URL." },
+        "provider": { "type": "string", "description": "Authentication provider identifier." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Profile creation timestamp." },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last profile sync timestamp." }
+      },
+      "required": ["uid"]
+    },
+    "CommunityPost": {
+      "title": "CommunityPost",
+      "description": "A public pixel art submission published to the NovaBlast Community Gallery.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Post identifier." },
+        "title": { "type": "string", "maxLength": 100, "description": "Post title." },
+        "authorId": { "type": "string", "description": "Author UID." },
+        "authorName": { "type": "string", "description": "Author display name." },
+        "authorAvatar": { "type": "string", "description": "Author avatar photo URL." },
+        "authorProvider": { "type": "string", "description": "Auth provider used by author." },
+        "previewImage": { "type": "string", "description": "Base64 preview data URL." },
+        "grid": { "type": "string", "description": "Serialized pixel grid JSON string." },
+        "frames": { "type": "array", "description": "Serialized animation frames array." },
+        "width": { "type": "integer", "description": "Canvas width." },
+        "height": { "type": "integer", "description": "Canvas height." },
+        "fps": { "type": "integer", "description": "FPS for animated artworks." },
+        "projectType": { "type": "string", "enum": ["static", "animated"], "description": "Type of artwork." },
+        "description": { "type": "string", "maxLength": 500, "description": "Optional post description." },
+        "allowDownload": { "type": "boolean", "description": "Whether PNG download is allowed by author." },
+        "likesCount": { "type": "integer", "description": "Number of likes." },
+        "viewsCount": { "type": "integer", "description": "Number of views." },
+        "tags": { "type": "array", "description": "Tags list (max 10)." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp." },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp." }
+      },
+      "required": ["title", "authorId", "authorName", "grid", "width", "height", "createdAt"]
+    }
+  },
+  "firestore": {
+    "projects/{projectId}": {
+      "schema": "Project",
+      "description": "A collection of pixel art projects."
+    },
+    "community_posts/{postId}": {
+      "schema": "CommunityPost",
+      "description": "Public community showcase posts."
+    },
+    "community_posts/{postId}/likes/{userId}": {
+      "schema": "object",
+      "description": "User likes for community posts."
+    },
+    "users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Public user profile metadata."
+    },
+    "users/{userId}/settings/hotkeys": {
+      "schema": "HotkeyConfig",
+      "description": "User specific hotkey configurations."
+    }
+  }
+}

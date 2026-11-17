@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NovaBlast — Редактор пиксель-арта и анимации</title>
+    <meta name="description" content="Хардкорный редактор пиксель-арта с историей изменений, покадровой анимацией, AI-генерацией и облачной синхронизацией." />
+    <meta property="og:title" content="NovaBlast — Редактор пиксель-арта и анимации" />
+    <meta property="og:description" content="Хардкорный редактор пиксель-арта с историей изменений и мощным набором инструментов. Веб-версия и приложение для Windows." />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Rubik:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+      window.addEventListener('unhandledrejection', function (e) {
+        if (e && e.reason && (String(e.reason).includes('WebSocket') || String(e.reason.message || '').includes('WebSocket'))) {
+          e.preventDefault();
+        }
+      });
+    </script>
+    <style>
+      body {
+        font-family: 'Rubik', sans-serif;
+        background-color: #0f172a;
+        color: #e2e8f0;
+        /* Scroll allowed on small screens. Touch-action is handled on canvas. */
+      }
+      .font-pixel {
+        font-family: 'Press Start 2P', cursive;
+      }
+      .animate-scanline {
+        animation: scanline 4s linear infinite;
+      }
+      @keyframes scanline {
+        0% { transform: translateY(-100%); }
+        100% { transform: translateY(100%); }
+      }
+      @keyframes shimmer {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(100%); }
+      }
+      /* Custom scrollbar for palette */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #1e293b; 
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #475569; 
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #64748b; 
+      }
+    </style>
+</head>
+  <body>
+    <div id="root"></div>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>

@@ -1,0 +1,120 @@
+@import "tailwindcss";
+
+@theme {
+  --animate-orbit-slow: orbit-slow 20s linear infinite;
+  --animate-orbit-fast: orbit-fast 5s linear infinite;
+  --animate-plasma-flow: plasma-flow 3s linear infinite;
+  --animate-plasma-flow-fast: plasma-flow 1s linear infinite;
+  --animate-core-pulse: core-pulse 4s ease-in-out infinite;
+  --animate-core-pulse-intense: core-pulse-intense 1.5s ease-in-out infinite;
+  --animate-suck-in: suck-in 3s linear infinite;
+  
+  --animate-ambient-breathe: ambient-breathe 25s ease-in-out infinite;
+  --animate-ambient-breathe-slow: ambient-breathe-slow 35s ease-in-out infinite;
+  --animate-ambient-breathe-delayed: ambient-breathe-delayed 30s ease-in-out infinite;
+  
+  --animate-supernova: supernova 12s ease-in-out infinite;
+  
+  @keyframes supernova {
+    0% { transform: translate3d(-50%, -50%, 0) scale(0.3); opacity: 0; }
+    50% { transform: translate3d(-50%, -50%, 0) scale(1.2); opacity: 0.6; }
+    100% { transform: translate3d(-50%, -50%, 0) scale(2); opacity: 0; }
+  }
+
+  @keyframes ambient-breathe {
+    0% { transform: scale(1) translate(0%, 0%); opacity: 0.15; }
+    25% { transform: scale(1.1) translate(8%, -12%); opacity: 0.4; }
+    50% { transform: scale(1.3) translate(-12%, 18%); opacity: 0.6; }
+    75% { transform: scale(1.15) translate(-15%, -10%); opacity: 0.4; }
+    100% { transform: scale(1) translate(0%, 0%); opacity: 0.15; }
+  }
+  @keyframes ambient-breathe-slow {
+    0% { transform: scale(1) translate(0%, 0%); opacity: 0.15; }
+    33% { transform: scale(1.4) translate(-20%, 10%); opacity: 0.6; }
+    66% { transform: scale(1.1) translate(15%, -20%); opacity: 0.3; }
+    100% { transform: scale(1) translate(0%, 0%); opacity: 0.15; }
+  }
+  @keyframes ambient-breathe-delayed {
+    0% { transform: scale(1.2) translate(15%, -15%); opacity: 0.2; }
+    33% { transform: scale(0.9) translate(-10%, 10%); opacity: 0.4; }
+    66% { transform: scale(1.4) translate(-25%, 20%); opacity: 0.6; }
+    100% { transform: scale(1.2) translate(15%, -15%); opacity: 0.2; }
+  }
+
+  @keyframes orbit-slow {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+  @keyframes orbit-fast {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+  @keyframes plasma-flow {
+    from { stroke-dashoffset: 100; }
+    to { stroke-dashoffset: 0; }
+  }
+  @keyframes plasma-flow-front {
+    from { stroke-dashoffset: 50; }
+    to { stroke-dashoffset: -50; }
+  }
+  @keyframes core-pulse {
+    0%, 100% { transform: scale(1); filter: brightness(1); }
+    50% { transform: scale(1.05); filter: brightness(1.2); }
+  }
+  @keyframes core-pulse-intense {
+    0%, 100% { transform: scale(1.1) rotate(0deg); filter: brightness(1.3); }
+    50% { transform: scale(1.2) rotate(180deg); filter: brightness(1.6); }
+  }
+  @keyframes suck-in {
+    0% { transform: scale(1.5) rotate(0deg); opacity: 0; }
+    20% { opacity: 1; }
+    80% { opacity: 1; }
+    100% { transform: scale(0.1) rotate(360deg); opacity: 0; }
+  }
+}
+
+html {
+  font-size: 17px;
+}
+
+@media (min-width: 1024px) {
+  html {
+    font-size: 18px;
+  }
+}
+
+html, body {
+  background-color: #0f172a;
+  color: white;
+  cursor: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'><defs><filter id='shadow'><feDropShadow dx='0' dy='2' stdDeviation='1.5' flood-opacity='0.4'/></filter></defs><path filter='url(%23shadow)' fill='%23ffffff' stroke='%23000000' stroke-width='2' stroke-linejoin='miter' d='M3,3 L3,19 L7,15 L10,21 L12,20 L9,14 L14,14 Z' /></svg>") 3 3, auto;
+  min-height: 100vh;
+}
+
+button, 
+a, 
+[role="button"], 
+select, 
+label,
+input[type="color"], 
+.cursor-pointer {
+  cursor: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'><defs><filter id='glow'><feDropShadow dx='0' dy='1' stdDeviation='1' flood-opacity='0.5'/><feDropShadow dx='0' dy='0' stdDeviation='2' flood-color='%23d946ef' flood-opacity='0.8'/></filter></defs><path filter='url(%23glow)' fill='%23d946ef' stroke='%23ffffff' stroke-width='2' stroke-linejoin='miter' d='M3,3 L3,19 L7,15 L10,21 L12,20 L9,14 L14,14 Z' /></svg>") 3 3, pointer !important;
+}
+
+button:disabled,
+.cursor-not-allowed,
+button:disabled.cursor-pointer,
+.disabled\:cursor-not-allowed:disabled {
+  cursor: not-allowed !important;
+}
+
+.canvas-cursor {
+  cursor: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'><defs><filter id='s'><feDropShadow dx='0' dy='1' stdDeviation='1' flood-opacity='0.8'/><feDropShadow dx='0' dy='0' stdDeviation='2' flood-color='%2322d3ee' flood-opacity='0.8'/></filter></defs><g filter='url(%23s)'><path fill='none' stroke='%23000000' stroke-width='4' stroke-linecap='square' d='M12,2 L12,9 M12,15 L12,22 M2,12 L9,12 M15,12 L22,12' /><path fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='square' d='M12,2 L12,9 M12,15 L12,22 M2,12 L9,12 M15,12 L22,12' /><circle cx='12' cy='12' r='2' fill='%23d946ef' stroke='%23000' stroke-width='1' /></g></svg>") 12 12, crosshair !important;
+}
+
+.cursor-grab {
+  cursor: grab !important;
+}
+
+.active\:cursor-grabbing:active {
+  cursor: grabbing !important;
+}

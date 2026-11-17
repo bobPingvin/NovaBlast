@@ -1,0 +1,6 @@
+{
+  "name": "NovaBlast",
+  "description": "Хардкорный редактор пиксель-арта с историей изменений и мощным набором инструментов.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
