@@ -200,6 +200,7 @@ function resolveBaseUrl(req: Request): string {
       const isAllowedOrigin =
         parsed.hostname === 'localhost' ||
         parsed.hostname === '127.0.0.1' ||
+        parsed.hostname.endsWith('.vercel.app') ||
         parsed.hostname.endsWith('.run.app') ||
         (process.env.APP_URL && parsed.origin === new URL(process.env.APP_URL).origin);
 
@@ -642,6 +643,15 @@ function renderPopupCallbackHtml(
       try {
         if (window.opener && !window.opener.closed) {
           window.opener.postMessage(data, '*');
+        }
+      } catch (e) {}
+      try {
+        if (typeof localStorage !== 'undefined') {
+          var serialized = JSON.stringify(Object.assign({}, data, { _ts: Date.now() }));
+          localStorage.setItem('novablast_oauth_bridge', serialized);
+          if (data.loginId) {
+            localStorage.setItem('novablast_oauth_bridge_' + data.loginId, serialized);
+          }
         }
       } catch (e) {}
       try {

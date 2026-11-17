@@ -13,7 +13,7 @@ interface AuthModalProps {
   onGithubLogin: () => void;
   onXLogin: () => void;
   onSteamLogin: () => void;
-  onSteamChallengeVerify?: (steamId: string, challengeCode: string) => Promise<boolean>;
+  onSteamChallengeVerify?: (steamId: string, challengeCode: string, challengeToken?: string) => Promise<boolean>;
   onSteamManualCallback?: (url: string) => Promise<boolean>;
   onSteamQrComplete?: (data: any) => Promise<void> | void;
   isLoggingIn: boolean;
@@ -56,6 +56,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [isVerifyingChallenge, setIsVerifyingChallenge] = useState(false);
   const [isCodeCopied, setIsCodeCopied] = useState(false);
   const [steamChallengeCode, setSteamChallengeCode] = useState('');
+  const [steamChallengeToken, setSteamChallengeToken] = useState('');
   const [steamFoundProfile, setSteamFoundProfile] = useState<{
     steamId: string;
     personaName: string;
@@ -214,6 +215,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       }
       setSteamFoundProfile(data.profile);
       setSteamChallengeCode(data.challengeCode);
+      setSteamChallengeToken(data.challengeToken || '');
       setSteamStep('challenge');
     } catch (err: any) {
       setSteamLocalError(err.message || (language === 'en' ? 'Failed to find profile' : 'Не удалось найти профиль Steam'));
@@ -228,7 +230,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setIsVerifyingChallenge(true);
     try {
       if (onSteamChallengeVerify) {
-        await onSteamChallengeVerify(steamFoundProfile.steamId, steamChallengeCode);
+        await onSteamChallengeVerify(steamFoundProfile.steamId, steamChallengeCode, steamChallengeToken);
         handleClose();
       }
     } catch (err: any) {

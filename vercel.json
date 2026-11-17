@@ -4,7 +4,23 @@
   "outputDirectory": "dist",
   "rewrites": [
     {
-      "source": "/((?!api/|assets/|downloads/|.*\\..*).*)",
+      "source": "/api/((?!router).*)",
+      "destination": "/api/router?__route=/api/$1"
+    },
+    {
+      "source": "/auth/(.*)",
+      "destination": "/api/router?__route=/auth/$1"
+    },
+    {
+      "source": "/__/auth/(.*)",
+      "destination": "https://gen-lang-client-0487154255.firebaseapp.com/__/auth/$1"
+    },
+    {
+      "source": "/__/firebase/(.*)",
+      "destination": "https://gen-lang-client-0487154255.firebaseapp.com/__/firebase/$1"
+    },
+    {
+      "source": "/((?!api/|auth/|__/|assets/|downloads/|.*\\..*).*)",
       "destination": "/index.html"
     }
   ]

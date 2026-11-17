@@ -23,7 +23,7 @@ import { ToolType, GridState, HistoryState, Project, HotkeyConfig, ProjectType, 
 import { INITIAL_COLOR, DEFAULT_HOTKEYS } from './constants';
 import { Language, getTranslation } from './src/l10n';
 import { auth, db, googleProvider, githubProvider, signInWithPopup, signInWithCustomToken, signOut, onAuthStateChanged, User, collection, doc, setDoc, getDocs, updateDoc, deleteDoc, query, where, orderBy, Timestamp, handleFirestoreError, OperationType, getDoc, signInWithEmailAndPassword, createUserWithEmailAndPassword, updateProfile } from './src/lib/firebase';
-import { signInWithRedirect, getRedirectResult, signInWithCredential, GoogleAuthProvider } from 'firebase/auth';
+import { signInWithCredential, GoogleAuthProvider } from 'firebase/auth';
 
 interface SteamSessionUser {
   uid: string;
@@ -441,36 +441,6 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Обработка возврата после signInWithRedirect
-  useEffect(() => {
-    const checkRedirectResult = async () => {
-      try {
-        const result = await getRedirectResult(auth);
-
-        if (result) {
-          toast.success('Успешный вход!', {
-            description: 'Теперь вы можете сохранять проекты в облаке.',
-          });
-        }
-      } catch (error: any) {
-        if (error.code !== 'auth/redirect-cancelled-by-user' && 
-            error.code !== 'auth/popup-closed-by-user' && 
-            error.code !== 'auth/cancelled-popup-request') {
-          console.error("Redirect result error:", error);
-          toast.error('Ошибка входа', {
-            description: error.message || 'Не удалось завершить вход',
-          });
-        }
-      } finally {
-        setIsLoggingIn(false);
-      }
-    };
-
-    if (isAuthReady) {
-      checkRedirectResult();
-    }
-  }, [isAuthReady]);
-
   const handleLogin = async () => {
     if (isLoggingIn) return;
     setIsLoggingIn(true);
@@ -517,6 +487,16 @@ const App: React.FC = () => {
         description = language === 'en' 
           ? 'The authorization window was closed.'
           : 'Окно авторизации было закрыто до завершения входа.';
+      } else if (error?.code === 'auth/network-request-failed') {
+        errorMessage = language === 'en' ? 'Network error connecting to Google' : 'Сбой сети при входе через Google';
+        description = language === 'en'
+          ? 'Could not reach Firebase/Google Auth servers. Check your internet/VPN or disable strict AdBlock/privacy shields on this site.'
+          : 'Браузер не смог подключиться к серверам Google/Firebase Auth. Проверьте интернет/VPN или отключите блокировщик рекламы/защиту от отслеживания для этого сайта.';
+      } else if (error?.code === 'auth/unauthorized-domain') {
+        errorMessage = language === 'en' ? 'Domain not authorized in Firebase' : 'Домен не добавлен в Firebase';
+        description = language === 'en'
+          ? `Add "${window.location.hostname}" (without https://) in Firebase Console → Authentication → Settings → Authorized domains.`
+          : `Добавьте "${window.location.hostname}" (без https:// и слэша) в Firebase Console → Authentication → Settings → Authorized domains.`;
       } else if (error?.message?.includes('not secure')) {
         errorMessage = language === 'en' ? 'Browser notice' : 'Google блокирует вход';
         description = language === 'en' 
@@ -1008,6 +988,7 @@ const App: React.FC = () => {
       if (
         origin &&
         origin !== window.location.origin &&
+        !origin.endsWith('.vercel.app') &&
         !origin.endsWith('.run.app') &&
         !origin.includes('localhost') &&
         !origin.includes('127.0.0.1')
@@ -1015,6 +996,16 @@ const App: React.FC = () => {
         return;
       }
       processAuthPayload(event.data);
+    };
+
+    const handleStorageBridge = (event: StorageEvent) => {
+      if (!event.key || !event.newValue) return;
+      if (event.key === 'novablast_oauth_bridge' || event.key.startsWith('novablast_oauth_bridge_')) {
+        try {
+          const payload = JSON.parse(event.newValue);
+          processAuthPayload(payload);
+        } catch {}
+      }
     };
 
     let bcSteam: BroadcastChannel | null = null;
@@ -1032,8 +1023,10 @@ const App: React.FC = () => {
     } catch {}
 
     window.addEventListener('message', handlePopupMessage);
+    window.addEventListener('storage', handleStorageBridge);
     return () => {
       window.removeEventListener('message', handlePopupMessage);
+      window.removeEventListener('storage', handleStorageBridge);
       try {
         bcSteam?.close();
         bcGithub?.close();
@@ -1141,6 +1134,29 @@ const App: React.FC = () => {
       }
 
       try {
+        try {
+          const bridgeRaw = localStorage.getItem(`novablast_oauth_bridge_${loginId}`);
+          if (bridgeRaw) {
+            localStorage.removeItem(`novablast_oauth_bridge_${loginId}`);
+            localStorage.removeItem('novablast_oauth_bridge');
+            const bridge = JSON.parse(bridgeRaw);
+            if (bridge?.type === 'STEAM_AUTH_SUCCESS' && bridge?.steamProfile) {
+              if (!completedSteamLoginsRef.current.has(loginId)) {
+                completedSteamLoginsRef.current.add(loginId);
+                await completeSteamAuth(bridge.customToken || null, bridge.steamProfile, bridge.sessionToken || null, false);
+              }
+              return;
+            }
+            if (bridge?.type === 'STEAM_AUTH_ERROR') {
+              if (!completedSteamLoginsRef.current.has(loginId)) {
+                completedSteamLoginsRef.current.add(loginId);
+                handleCancelSteamLogin(bridge.error);
+              }
+              return;
+            }
+          }
+        } catch {}
+
         const resp = await fetch(`/api/auth/steam/poll/${encodeURIComponent(loginId)}`, {
           cache: 'no-store',
           credentials: 'include',
@@ -1213,13 +1229,13 @@ const App: React.FC = () => {
     }
   };
 
-  const handleSteamChallengeVerify = async (steamId: string, challengeCode: string): Promise<boolean> => {
+  const handleSteamChallengeVerify = async (steamId: string, challengeCode: string, challengeToken?: string): Promise<boolean> => {
     try {
       setIsSteamLoggingIn(true);
       const resp = await fetch('/api/auth/steam/verify-challenge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ steamId, challengeCode }),
+        body: JSON.stringify({ steamId, challengeCode, challengeToken }),
       });
       const data = await resp.json();
       if (!resp.ok || !data.authenticated || !data.steamProfile) {
@@ -1310,31 +1326,42 @@ const App: React.FC = () => {
       const urlData = await urlResp.json();
 
       if (!urlData?.configured || !urlData?.url) {
-        setIsGithubLoggingIn(false);
-        toast.error(
-          language === 'en' ? 'GitHub sign-in setup' : 'Настройка входа через GitHub',
-          {
-            duration: 12000,
-            description: (
-              <div className="flex flex-col gap-2 mt-1">
-                <span>
-                  {language === 'en'
-                    ? 'To enable GitHub sign-in, activate GitHub in Firebase Console (Authentication → Sign-in method), or set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET environment variables.'
-                    : 'Чтобы включить вход через GitHub, активируйте провайдера GitHub в Firebase Console (Authentication → Sign-in method → GitHub), либо укажите GITHUB_CLIENT_ID и GITHUB_CLIENT_SECRET в переменных окружения.'}
-                </span>
-                <a
-                  href="https://console.firebase.google.com/project/gen-lang-client-0487154255/authentication/providers"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs text-indigo-400 hover:text-indigo-300 underline font-mono"
-                >
-                  {language === 'en' ? 'Open Firebase Console ↗' : 'Открыть Firebase Console ↗'}
-                </a>
-              </div>
-            ),
+        // Fallback: try Firebase Auth GitHub provider directly if enabled in Firebase Console
+        try {
+          await signInWithPopup(auth, githubProvider);
+          setIsGithubLoggingIn(false);
+          toast.success(language === 'en' ? 'Successfully signed in with GitHub!' : 'Вы успешно вошли через GitHub!');
+          return;
+        } catch (fbErr: any) {
+          setIsGithubLoggingIn(false);
+          if (fbErr?.code === 'auth/popup-closed-by-user' || fbErr?.code === 'auth/cancelled-popup-request') {
+            return;
           }
-        );
-        return;
+          toast.error(
+            language === 'en' ? 'GitHub sign-in setup' : 'Настройка входа через GitHub',
+            {
+              duration: 12000,
+              description: (
+                <div className="flex flex-col gap-2 mt-1">
+                  <span>
+                    {language === 'en'
+                      ? `Enable GitHub in Firebase Console (Authentication → Sign-in method) OR add GITHUB_CLIENT_ID & GITHUB_CLIENT_SECRET in environment variables with callback: ${baseUrl}/auth/github/callback`
+                      : `Включите GitHub в Firebase Console (Authentication → Sign-in method → GitHub), либо добавьте GITHUB_CLIENT_ID и GITHUB_CLIENT_SECRET в переменные окружения Vercel с callback URL: ${baseUrl}/auth/github/callback`}
+                  </span>
+                  <a
+                    href="https://console.firebase.google.com/project/gen-lang-client-0487154255/authentication/providers"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-indigo-400 hover:text-indigo-300 underline font-mono"
+                  >
+                    {language === 'en' ? 'Open Firebase Console ↗' : 'Открыть Firebase Console ↗'}
+                  </a>
+                </div>
+              ),
+            }
+          );
+          return;
+        }
       }
 
       const authWindow = window.open(
@@ -1388,6 +1415,29 @@ const App: React.FC = () => {
         }
 
         try {
+          try {
+            const bridgeRaw = localStorage.getItem(`novablast_oauth_bridge_${loginId}`);
+            if (bridgeRaw) {
+              localStorage.removeItem(`novablast_oauth_bridge_${loginId}`);
+              localStorage.removeItem('novablast_oauth_bridge');
+              const bridge = JSON.parse(bridgeRaw);
+              if (bridge?.type === 'GITHUB_AUTH_SUCCESS' && bridge?.githubProfile) {
+                if (!completedGithubLoginsRef.current.has(loginId)) {
+                  completedGithubLoginsRef.current.add(loginId);
+                  await completeGithubAuth(bridge.customToken || null, bridge.githubProfile, bridge.sessionToken || null, false);
+                }
+                return;
+              }
+              if (bridge?.type === 'GITHUB_AUTH_ERROR') {
+                if (!completedGithubLoginsRef.current.has(loginId)) {
+                  completedGithubLoginsRef.current.add(loginId);
+                  handleCancelGithubLogin(bridge.error);
+                }
+                return;
+              }
+            }
+          } catch {}
+
           const resp = await fetch(`/api/auth/github/poll/${encodeURIComponent(loginId)}`, {
             cache: 'no-store',
             credentials: 'include',
@@ -1472,8 +1522,8 @@ const App: React.FC = () => {
               <div className="flex flex-col gap-2 mt-1">
                 <span>
                   {language === 'en'
-                    ? 'To enable X sign-in, set X_CLIENT_ID and X_CLIENT_SECRET environment variables.'
-                    : 'Чтобы включить вход через X (Twitter), укажите X_CLIENT_ID и X_CLIENT_SECRET в переменных окружения.'}
+                    ? `To enable X sign-in, set X_CLIENT_ID and X_CLIENT_SECRET environment variables in Vercel with callback URL: ${baseUrl}/auth/x/callback`
+                    : `Чтобы включить вход через X (Twitter), укажите X_CLIENT_ID и X_CLIENT_SECRET в переменных окружения Vercel и добавьте callback URL: ${baseUrl}/auth/x/callback`}
                 </span>
               </div>
             ),
@@ -1533,6 +1583,29 @@ const App: React.FC = () => {
         }
 
         try {
+          try {
+            const bridgeRaw = localStorage.getItem(`novablast_oauth_bridge_${loginId}`);
+            if (bridgeRaw) {
+              localStorage.removeItem(`novablast_oauth_bridge_${loginId}`);
+              localStorage.removeItem('novablast_oauth_bridge');
+              const bridge = JSON.parse(bridgeRaw);
+              if (bridge?.type === 'X_AUTH_SUCCESS' && bridge?.xProfile) {
+                if (!completedXLoginsRef.current.has(loginId)) {
+                  completedXLoginsRef.current.add(loginId);
+                  await completeXAuth(bridge.customToken || null, bridge.xProfile, bridge.sessionToken || null, false);
+                }
+                return;
+              }
+              if (bridge?.type === 'X_AUTH_ERROR') {
+                if (!completedXLoginsRef.current.has(loginId)) {
+                  completedXLoginsRef.current.add(loginId);
+                  handleCancelXLogin(bridge.error);
+                }
+                return;
+              }
+            }
+          } catch {}
+
           const resp = await fetch(`/api/auth/x/poll/${encodeURIComponent(loginId)}`, {
             cache: 'no-store',
             credentials: 'include',
