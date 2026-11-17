@@ -168,35 +168,6 @@ npm run dev:electron
 
 ---
 
-## ▲ Деплой веб-версии на Vercel
-
-Проект уже включает сконфигурированный [`vercel.json`](./vercel.json) для SPA-маршрутов (`/` и `/app`).
-
-1. Загрузите репозиторий на **GitHub** и импортируйте его в **Vercel** (*Framework Preset: `Vite`*).
-2. Проверьте команды сборки:
-   - **Build Command:** `npm run build`
-   - **Output Directory:** `dist`
-3. В разделе **Environment Variables** добавьте `VITE_WINDOWS_DOWNLOAD_URL` со ссылкой на ваш релиз `.exe` (например, из GitHub Releases), чтобы кнопка **«Скачать для Windows»** на главной странице сразу отдавала установщик. *(Альтернативно можно положить файл напрямую в `public/downloads/NovaBlast-Setup.exe`)*.
-4. Добавьте домен Vercel (например, `your-app.vercel.app`) в **Firebase Console → Authentication → Settings → Authorized domains**, чтобы работали вход через Google и облачные сохранения.
-
----
-
-## 📦 Сборка десктопного приложения
-
-Конфигурация `electron-builder` уже настроена в `package.json` (`NSIS` для Windows, `AppImage` / `deb` / `rpm` для Linux, `DMG` для macOS):
-
-```bash
-# Сборка установщика для текущей платформы (результат появится в папке release/)
-npm run build:electron
-
-# Сборка пакетов для Linux
-npm run build:linux      # AppImage
-npm run build:linux-deb  # Debian / Ubuntu (.deb)
-npm run build:linux-rpm  # ALT / Fedora / Red Hat (.rpm)
-```
-
----
-
 ## 🗂️ Структура проекта
 
 ```text
