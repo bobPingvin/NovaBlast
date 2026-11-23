@@ -29,6 +29,8 @@ const isProd =
   process.env.npm_lifecycle_event === 'start';
 
 const SESSION_COOKIE_NAME = 'novablast_steam_session';
+const GITHUB_COOKIE_NAME = 'novablast_github_session';
+const X_COOKIE_NAME = 'novablast_x_session';
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -226,11 +228,11 @@ function resolveBaseUrl(req: Request): string {
   return `http://localhost:${PORT}`;
 }
 
-function signSessionPayload(profile: SteamPlayerProfile | GitHubUserProfile | object): string {
+function signTokenPayload(data: Record<string, unknown>, ttlSeconds: number): string {
   const payload = Buffer.from(
     JSON.stringify({
-      ...profile,
-      exp: Math.floor(Date.now() / 1000) + SESSION_MAX_AGE_SECONDS,
+      ...data,
+      exp: Math.floor(Date.now() / 1000) + ttlSeconds,
     }),
     'utf-8'
   ).toString('base64url');
@@ -241,6 +243,40 @@ function signSessionPayload(profile: SteamPlayerProfile | GitHubUserProfile | ob
     .digest('base64url');
 
   return `${payload}.${sig}`;
+}
+
+function verifyGenericTokenPayload<T = Record<string, any>>(token: string | undefined | null): T | null {
+  if (!token) return null;
+  const dotIdx = token.indexOf('.');
+  if (dotIdx === -1) return null;
+
+  const payload = token.slice(0, dotIdx);
+  const sig = token.slice(dotIdx + 1);
+
+  const expectedSig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(payload)
+    .digest('base64url');
+
+  const sigBuf = Buffer.from(sig);
+  const expectedBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    return null;
+  }
+
+  try {
+    const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf-8'));
+    if (decoded.exp && decoded.exp < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+    return decoded as T;
+  } catch {
+    return null;
+  }
+}
+
+function signSessionPayload(profile: SteamPlayerProfile | GitHubUserProfile | XUserProfile | object): string {
+  return signTokenPayload(profile as Record<string, unknown>, SESSION_MAX_AGE_SECONDS);
 }
 
 function verifySignedToken(token: string | undefined | null): SteamPlayerProfile | null {
@@ -1335,19 +1371,21 @@ async function startServer() {
       (typeof forwardedProto === 'string' && forwardedProto.includes('https')) ||
       Boolean(process.env.APP_URL?.startsWith('https://'));
 
-    res.clearCookie(SESSION_COOKIE_NAME, {
-      httpOnly: true,
-      secure: isHttps,
-      sameSite: isHttps ? 'none' : 'lax',
-      partitioned: isHttps,
-      path: '/',
-    });
-    res.clearCookie(SESSION_COOKIE_NAME, {
-      httpOnly: true,
-      secure: isHttps,
-      sameSite: isHttps ? 'none' : 'lax',
-      path: '/',
-    });
+    for (const cookieName of [SESSION_COOKIE_NAME, GITHUB_COOKIE_NAME, X_COOKIE_NAME]) {
+      res.clearCookie(cookieName, {
+        httpOnly: true,
+        secure: isHttps,
+        sameSite: isHttps ? 'none' : 'lax',
+        partitioned: isHttps,
+        path: '/',
+      });
+      res.clearCookie(cookieName, {
+        httpOnly: true,
+        secure: isHttps,
+        sameSite: isHttps ? 'none' : 'lax',
+        path: '/',
+      });
+    }
     res.json({ ok: true });
   });
 
@@ -1798,12 +1836,7 @@ async function startServer() {
         }
       }
 
-      const sessionToken = signSessionPayload({
-        steamId: `github_${githubProfile.githubId}`,
-        personaName: githubProfile.name,
-        avatarUrl: githubProfile.avatarUrl,
-        profileUrl: githubProfile.profileUrl,
-      });
+      const sessionToken = signSessionPayload(githubProfile);
 
       if (loginId) {
         pendingGitHubLogins.set(loginId, {
@@ -1814,6 +1847,21 @@ async function startServer() {
           createdAt: Date.now(),
         });
       }
+
+      const ghForwardedProto = req.headers['x-forwarded-proto'];
+      const ghIsHttps =
+        req.secure ||
+        (typeof ghForwardedProto === 'string' && ghForwardedProto.includes('https')) ||
+        Boolean(process.env.APP_URL?.startsWith('https://'));
+
+      res.cookie(GITHUB_COOKIE_NAME, sessionToken, {
+        httpOnly: true,
+        secure: ghIsHttps,
+        sameSite: ghIsHttps ? 'none' : 'lax',
+        partitioned: ghIsHttps,
+        maxAge: SESSION_MAX_AGE_SECONDS * 1000,
+        path: '/',
+      });
 
       res.send(
         renderPopupCallbackHtml(
@@ -1859,7 +1907,47 @@ async function startServer() {
   app.get('/api/auth/github/callback/:loginId', githubCallbackHandler);
   app.get('/api/auth/github/callback', githubCallbackHandler);
 
-  // 7. X (Twitter) OAuth 2.0 Endpoints
+  app.get('/api/auth/github/session', async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const authHeader = req.headers.authorization;
+    const bearerToken = typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const cookieToken = typeof req.cookies?.[GITHUB_COOKIE_NAME] === 'string' ? req.cookies[GITHUB_COOKIE_NAME] : '';
+    const decoded = verifyGenericTokenPayload<any>(bearerToken || cookieToken);
+    const rawId = decoded?.githubId || (typeof decoded?.steamId === 'string' && decoded.steamId.startsWith('github_') ? decoded.steamId.slice(7) : '');
+    if (!rawId) {
+      res.json({ authenticated: false });
+      return;
+    }
+    const login = String(decoded.login || decoded.personaName || `user_${rawId}`);
+    const profile: GitHubUserProfile = {
+      githubId: String(rawId),
+      login,
+      name: String(decoded.name || decoded.personaName || login),
+      avatarUrl: String(decoded.avatarUrl || ''),
+      profileUrl: String(decoded.profileUrl || `https://github.com/${login}`),
+      email: decoded.email ? String(decoded.email) : undefined,
+    };
+    let customToken: string | null = null;
+    const admin = getFirebaseAdmin();
+    if (admin) {
+      try {
+        customToken = await admin.createCustomToken(`github_${profile.githubId}`, {
+          provider: 'github',
+          githubId: profile.githubId,
+          login: profile.login,
+        });
+      } catch {}
+    }
+    res.json({
+      authenticated: true,
+      githubProfile: profile,
+      customToken,
+      sessionToken: signSessionPayload(profile),
+      firebaseCustomAuthReady: Boolean(customToken),
+    });
+  });
+
+  // 7. X (Twitter) OAuth 2.0 Endpoints (PKCE S256 + signed state)
   app.get('/api/auth/x/url', (req: Request, res: Response) => {
     cleanupExpiredPendingLogins();
     const baseUrl = resolveBaseUrl(req);
@@ -1885,17 +1973,21 @@ async function startServer() {
       createdAt: Date.now(),
     });
 
+    const codeVerifier = crypto.randomBytes(32).toString('base64url');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+    const signedState = signTokenPayload({ loginId, cv: codeVerifier, p: 'x' }, 600);
+
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: clientId,
       redirect_uri: callbackUrl,
-      scope: 'tweet.read users.read offline.access',
-      state: loginId,
-      code_challenge: 'challenge',
-      code_challenge_method: 'plain',
+      scope: 'users.read tweet.read',
+      state: signedState,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
     });
 
-    const url = `https://twitter.com/i/oauth2/authorize?${params.toString()}`;
+    const url = `https://x.com/i/oauth2/authorize?${params.toString()}`;
     res.setHeader('Cache-Control', 'no-store');
     res.json({ url, callbackUrl, loginId, configured: true });
   });
@@ -1944,11 +2036,15 @@ async function startServer() {
 
   const xCallbackHandler = async (req: Request, res: Response) => {
     cleanupExpiredPendingLogins();
+    const rawState = typeof req.query.state === 'string' ? req.query.state.trim() : '';
+    const statePayload = verifyGenericTokenPayload<{ loginId?: string; cv?: string; p?: string }>(rawState);
     const rawLoginId =
       (typeof req.params.loginId === 'string' ? req.params.loginId : '') ||
-      (typeof req.query.state === 'string' ? req.query.state : '') ||
+      (statePayload?.p === 'x' && statePayload.loginId ? statePayload.loginId : '') ||
+      (!rawState.includes('.') ? rawState : '') ||
       (typeof req.query.loginId === 'string' ? req.query.loginId : '');
     const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId.trim()) ? rawLoginId.trim() : '';
+    const codeVerifier = statePayload?.p === 'x' && statePayload.cv ? statePayload.cv : 'challenge';
 
     const errorParam = req.query.error;
     if (errorParam) {
@@ -2010,19 +2106,24 @@ async function startServer() {
     }
 
     try {
+      const tokenBody = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: callbackUrl,
+        code_verifier: codeVerifier,
+      });
+      if (!clientSecret) {
+        tokenBody.set('client_id', clientId);
+      }
+
       const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-      const tokenResp = await fetch('https://api.twitter.com/2/oauth2/token', {
+      const tokenResp = await fetch('https://api.x.com/2/oauth2/token', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           ...(clientSecret ? { Authorization: `Basic ${credentials}` } : {}),
         },
-        body: new URLSearchParams({
-          grant_type: 'authorization_code',
-          code,
-          redirect_uri: callbackUrl,
-          code_verifier: 'challenge',
-        }),
+        body: tokenBody,
         signal: AbortSignal.timeout(10000),
       });
 
@@ -2033,7 +2134,7 @@ async function startServer() {
 
       const accessToken = tokenData.access_token;
 
-      const userResp = await fetch('https://api.twitter.com/2/users/me?user.fields=profile_image_url,username,name', {
+      const userResp = await fetch('https://api.x.com/2/users/me?user.fields=profile_image_url,username,name', {
         headers: {
           Authorization: `Bearer ${accessToken}`,
         },
@@ -2058,12 +2159,16 @@ async function startServer() {
         throw new Error('Не удалось получить данные пользователя из X.');
       }
 
+      const hiResAvatar = xUser.profile_image_url
+        ? xUser.profile_image_url.replace(/_normal(\.[a-z0-9]+)$/i, '_400x400$1')
+        : '';
+
       const xProfile: XUserProfile = {
         xId: String(xUser.id),
         username: xUser.username,
         name: xUser.name || xUser.username,
-        avatarUrl: xUser.profile_image_url || '',
-        profileUrl: `https://twitter.com/${xUser.username}`,
+        avatarUrl: hiResAvatar,
+        profileUrl: `https://x.com/${xUser.username}`,
       };
 
       let customToken: string | null = null;
@@ -2080,12 +2185,7 @@ async function startServer() {
         }
       }
 
-      const sessionToken = signSessionPayload({
-        steamId: `x_${xProfile.xId}`,
-        personaName: xProfile.name,
-        avatarUrl: xProfile.avatarUrl,
-        profileUrl: xProfile.profileUrl,
-      });
+      const sessionToken = signSessionPayload(xProfile);
 
       if (loginId) {
         pendingXLogins.set(loginId, {
@@ -2096,6 +2196,21 @@ async function startServer() {
           createdAt: Date.now(),
         });
       }
+
+      const xForwardedProto = req.headers['x-forwarded-proto'];
+      const xIsHttps =
+        req.secure ||
+        (typeof xForwardedProto === 'string' && xForwardedProto.includes('https')) ||
+        Boolean(process.env.APP_URL?.startsWith('https://'));
+
+      res.cookie(X_COOKIE_NAME, sessionToken, {
+        httpOnly: true,
+        secure: xIsHttps,
+        sameSite: xIsHttps ? 'none' : 'lax',
+        partitioned: xIsHttps,
+        maxAge: SESSION_MAX_AGE_SECONDS * 1000,
+        path: '/',
+      });
 
       res.send(
         renderPopupCallbackHtml(
@@ -2140,6 +2255,45 @@ async function startServer() {
   app.get('/auth/x/callback/', xCallbackHandler);
   app.get('/api/auth/x/callback/:loginId', xCallbackHandler);
   app.get('/api/auth/x/callback', xCallbackHandler);
+
+  app.get('/api/auth/x/session', async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const authHeader = req.headers.authorization;
+    const bearerToken = typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const cookieToken = typeof req.cookies?.[X_COOKIE_NAME] === 'string' ? req.cookies[X_COOKIE_NAME] : '';
+    const decoded = verifyGenericTokenPayload<any>(bearerToken || cookieToken);
+    const rawId = decoded?.xId || (typeof decoded?.steamId === 'string' && decoded.steamId.startsWith('x_') ? decoded.steamId.slice(2) : '');
+    if (!rawId) {
+      res.json({ authenticated: false });
+      return;
+    }
+    const username = String(decoded.username || decoded.personaName || `x_${rawId}`);
+    const profile: XUserProfile = {
+      xId: String(rawId),
+      username,
+      name: String(decoded.name || decoded.personaName || username),
+      avatarUrl: String(decoded.avatarUrl || ''),
+      profileUrl: String(decoded.profileUrl || `https://x.com/${username}`),
+    };
+    let customToken: string | null = null;
+    const admin = getFirebaseAdmin();
+    if (admin) {
+      try {
+        customToken = await admin.createCustomToken(`x_${profile.xId}`, {
+          provider: 'x',
+          xId: profile.xId,
+          username: profile.username,
+        });
+      } catch {}
+    }
+    res.json({
+      authenticated: true,
+      xProfile: profile,
+      customToken,
+      sessionToken: signSessionPayload(profile),
+      firebaseCustomAuthReady: Boolean(customToken),
+    });
+  });
 
   // 8. AI Content Moderation Endpoint (Gemini Vision Safety Verification)
   app.post('/api/moderation/inspect', async (req: Request, res: Response) => {

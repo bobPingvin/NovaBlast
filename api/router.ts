@@ -11,6 +11,8 @@ type VercelRequest = IncomingMessage & {
 type VercelResponse = ServerResponse;
 
 const SESSION_COOKIE_NAME = 'novablast_steam_session';
+const GITHUB_COOKIE_NAME = 'novablast_github_session';
+const X_COOKIE_NAME = 'novablast_x_session';
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const CHALLENGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -252,17 +254,9 @@ function verifySignedToken(token: string | undefined | null): SteamPlayerProfile
   };
 }
 
-function extractSessionProfile(req: VercelRequest): SteamPlayerProfile | null {
-  const authHeader = req.headers.authorization;
-  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-    const bearerToken = authHeader.slice(7).trim();
-    const fromBearer = verifySignedToken(bearerToken);
-    if (fromBearer) return fromBearer;
-  }
-
+function parseCookies(req: VercelRequest): Record<string, string> {
   const cookieHeader = req.headers.cookie;
-  if (!cookieHeader) return null;
-
+  if (!cookieHeader) return {};
   const cookies: Record<string, string> = {};
   for (const part of cookieHeader.split(';')) {
     const idx = part.indexOf('=');
@@ -276,13 +270,83 @@ function extractSessionProfile(req: VercelRequest): SteamPlayerProfile | null {
       }
     }
   }
+  return cookies;
+}
 
+function extractBearerToken(req: VercelRequest): string | null {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    return token || null;
+  }
+  return null;
+}
+
+function extractSessionProfile(req: VercelRequest): SteamPlayerProfile | null {
+  const bearerToken = extractBearerToken(req);
+  if (bearerToken) {
+    const fromBearer = verifySignedToken(bearerToken);
+    if (fromBearer) return fromBearer;
+  }
+
+  const cookies = parseCookies(req);
   return verifySignedToken(cookies[SESSION_COOKIE_NAME]);
 }
 
-function buildSessionCookieHeader(value: string, maxAgeSeconds: number, isHttps: boolean): string {
+function verifyGithubToken(token: string | undefined | null): GitHubUserProfile | null {
+  const decoded = verifyTokenPayload<any>(token);
+  if (!decoded) return null;
+  const rawId = decoded.githubId || (typeof decoded.steamId === 'string' && decoded.steamId.startsWith('github_') ? decoded.steamId.slice(7) : '');
+  if (!rawId) return null;
+  const login = String(decoded.login || decoded.personaName || `user_${rawId}`);
+  return {
+    githubId: String(rawId),
+    login,
+    name: String(decoded.name || decoded.personaName || login),
+    avatarUrl: String(decoded.avatarUrl || ''),
+    profileUrl: String(decoded.profileUrl || `https://github.com/${login}`),
+    email: decoded.email ? String(decoded.email) : undefined,
+  };
+}
+
+function extractGithubSessionProfile(req: VercelRequest): GitHubUserProfile | null {
+  const bearerToken = extractBearerToken(req);
+  if (bearerToken) {
+    const fromBearer = verifyGithubToken(bearerToken);
+    if (fromBearer) return fromBearer;
+  }
+  const cookies = parseCookies(req);
+  return verifyGithubToken(cookies[GITHUB_COOKIE_NAME]);
+}
+
+function verifyXToken(token: string | undefined | null): XUserProfile | null {
+  const decoded = verifyTokenPayload<any>(token);
+  if (!decoded) return null;
+  const rawId = decoded.xId || (typeof decoded.steamId === 'string' && decoded.steamId.startsWith('x_') ? decoded.steamId.slice(2) : '');
+  if (!rawId) return null;
+  const username = String(decoded.username || decoded.personaName || `x_${rawId}`);
+  return {
+    xId: String(rawId),
+    username,
+    name: String(decoded.name || decoded.personaName || username),
+    avatarUrl: String(decoded.avatarUrl || ''),
+    profileUrl: String(decoded.profileUrl || `https://x.com/${username}`),
+  };
+}
+
+function extractXSessionProfile(req: VercelRequest): XUserProfile | null {
+  const bearerToken = extractBearerToken(req);
+  if (bearerToken) {
+    const fromBearer = verifyXToken(bearerToken);
+    if (fromBearer) return fromBearer;
+  }
+  const cookies = parseCookies(req);
+  return verifyXToken(cookies[X_COOKIE_NAME]);
+}
+
+function buildCookieHeader(name: string, value: string, maxAgeSeconds: number, isHttps: boolean): string {
   const parts = [
-    `${SESSION_COOKIE_NAME}=${encodeURIComponent(value)}`,
+    `${name}=${encodeURIComponent(value)}`,
     `Path=/`,
     `Max-Age=${maxAgeSeconds}`,
     `HttpOnly`,
@@ -294,17 +358,22 @@ function buildSessionCookieHeader(value: string, maxAgeSeconds: number, isHttps:
   return parts.join('; ');
 }
 
-function buildClearSessionCookieHeaders(isHttps: boolean): string[] {
+function buildSessionCookieHeader(value: string, maxAgeSeconds: number, isHttps: boolean): string {
+  return buildCookieHeader(SESSION_COOKIE_NAME, value, maxAgeSeconds, isHttps);
+}
+
+function buildClearSessionCookieHeaders(isHttps: boolean, cookieNames: string[] = [SESSION_COOKIE_NAME, GITHUB_COOKIE_NAME, X_COOKIE_NAME]): string[] {
   const expired = 'Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT';
-  const headers = [
-    `${SESSION_COOKIE_NAME}=; Path=/; ${expired}; HttpOnly; SameSite=Lax`,
-  ];
-  if (isHttps) {
-    headers.push(
-      `${SESSION_COOKIE_NAME}=; Path=/; ${expired}; HttpOnly; SameSite=None; Secure`,
-      `${SESSION_COOKIE_NAME}=; Path=/; ${expired}; HttpOnly; SameSite=None; Secure; Partitioned`,
-      `${SESSION_COOKIE_NAME}=; Path=/; ${expired}; HttpOnly; SameSite=Lax; Secure`
-    );
+  const headers: string[] = [];
+  for (const cookieName of cookieNames) {
+    headers.push(`${cookieName}=; Path=/; ${expired}; HttpOnly; SameSite=Lax`);
+    if (isHttps) {
+      headers.push(
+        `${cookieName}=; Path=/; ${expired}; HttpOnly; SameSite=None; Secure`,
+        `${cookieName}=; Path=/; ${expired}; HttpOnly; SameSite=None; Secure; Partitioned`,
+        `${cookieName}=; Path=/; ${expired}; HttpOnly; SameSite=Lax; Secure`
+      );
+    }
   }
   return headers;
 }
@@ -1440,12 +1509,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           login: githubProfile.login,
         });
 
-        const sessionToken = signSessionPayload({
-          steamId: `github_${githubProfile.githubId}`,
-          personaName: githubProfile.name,
-          avatarUrl: githubProfile.avatarUrl,
-          profileUrl: githubProfile.profileUrl,
-        });
+        const sessionToken = signSessionPayload(githubProfile);
 
         sendHtml(
           res,
@@ -1463,7 +1527,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             'Авторизация через GitHub успешно завершена. Окно сейчас закроется.',
             true,
             githubProfile.avatarUrl
-          )
+          ),
+          {
+            'Set-Cookie': buildCookieHeader(GITHUB_COOKIE_NAME, sessionToken, SESSION_MAX_AGE_SECONDS, httpsFlag),
+          }
         );
       } catch (err: any) {
         console.error('[GitHub Auth] Callback error:', err);
@@ -1482,7 +1549,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    // 14. X (Twitter) OAuth 2.0 URL
+    // 13a. GitHub Session Check & Logout
+    if (pathname === '/api/auth/github/session' && method === 'GET') {
+      const profile = extractGithubSessionProfile(req);
+      if (!profile) {
+        sendJson(res, 200, { authenticated: false });
+        return;
+      }
+      const customToken = createFirebaseCustomToken(`github_${profile.githubId}`, {
+        provider: 'github',
+        githubId: profile.githubId,
+        login: profile.login,
+      });
+      sendJson(res, 200, {
+        authenticated: true,
+        githubProfile: profile,
+        customToken,
+        sessionToken: signSessionPayload(profile),
+        firebaseCustomAuthReady: Boolean(customToken),
+      });
+      return;
+    }
+
+    if (pathname === '/api/auth/github/logout' && (method === 'POST' || method === 'GET')) {
+      sendJson(res, 200, { ok: true }, { 'Set-Cookie': buildClearSessionCookieHeaders(httpsFlag, [GITHUB_COOKIE_NAME]) });
+      return;
+    }
+
+    // 14. X (Twitter) OAuth 2.0 URL (PKCE S256 + stateless signed state)
     if (pathname === '/api/auth/x/url' && method === 'GET') {
       const clientId = (process.env.X_CLIENT_ID || process.env.TWITTER_CLIENT_ID || '').trim();
       const rawLoginId = getQueryString(queryParams, 'loginId').trim();
@@ -1499,18 +1593,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return;
       }
 
+      const codeVerifier = crypto.randomBytes(32).toString('base64url');
+      const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+      const signedState = signTokenPayload({ loginId, cv: codeVerifier, p: 'x' }, 600);
+
       const params = new URLSearchParams({
         response_type: 'code',
         client_id: clientId,
         redirect_uri: callbackUrl,
-        scope: 'tweet.read users.read offline.access',
-        state: loginId,
-        code_challenge: 'challenge',
-        code_challenge_method: 'plain',
+        scope: 'users.read tweet.read',
+        state: signedState,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
       });
 
       sendJson(res, 200, {
-        url: `https://twitter.com/i/oauth2/authorize?${params.toString()}`,
+        url: `https://x.com/i/oauth2/authorize?${params.toString()}`,
         callbackUrl,
         loginId,
         configured: true,
@@ -1528,8 +1626,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (pathname.startsWith('/auth/x/callback') || pathname.startsWith('/api/auth/x/callback')) {
       const segs = pathname.split('/').filter(Boolean);
       const maybeLoginId = segs[segs.length - 1] !== 'callback' ? segs[segs.length - 1] : '';
-      const rawLoginId = maybeLoginId || getQueryString(queryParams, 'state') || getQueryString(queryParams, 'loginId');
+      const rawState = getQueryString(queryParams, 'state').trim();
+      const statePayload = verifyTokenPayload<{ loginId?: string; cv?: string; p?: string }>(rawState);
+      const rawLoginId =
+        maybeLoginId ||
+        (statePayload?.p === 'x' && statePayload.loginId ? statePayload.loginId : '') ||
+        (!rawState.includes('.') ? rawState : '') ||
+        getQueryString(queryParams, 'loginId');
       const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId.trim()) ? rawLoginId.trim() : '';
+      const codeVerifier = statePayload?.p === 'x' && statePayload.cv ? statePayload.cv : 'challenge';
 
       const errorParam = getQueryString(queryParams, 'error');
       if (errorParam) {
@@ -1582,19 +1687,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
 
       try {
+        const tokenBody = new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: callbackUrl,
+          code_verifier: codeVerifier,
+        });
+        if (!clientSecret) {
+          tokenBody.set('client_id', clientId);
+        }
+
         const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-        const tokenResp = await fetch('https://api.twitter.com/2/oauth2/token', {
+        const tokenResp = await fetch('https://api.x.com/2/oauth2/token', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
             ...(clientSecret ? { Authorization: `Basic ${credentials}` } : {}),
           },
-          body: new URLSearchParams({
-            grant_type: 'authorization_code',
-            code,
-            redirect_uri: callbackUrl,
-            code_verifier: 'challenge',
-          }),
+          body: tokenBody,
           signal: AbortSignal.timeout(10000),
         });
 
@@ -1604,7 +1714,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
 
         const accessToken = tokenData.access_token;
-        const userResp = await fetch('https://api.twitter.com/2/users/me?user.fields=profile_image_url,username,name', {
+        const userResp = await fetch('https://api.x.com/2/users/me?user.fields=profile_image_url,username,name', {
           headers: {
             Authorization: `Bearer ${accessToken}`,
           },
@@ -1629,12 +1739,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           throw new Error('Не удалось получить данные пользователя из X.');
         }
 
+        const hiResAvatar = xUser.profile_image_url
+          ? xUser.profile_image_url.replace(/_normal(\.[a-z0-9]+)$/i, '_400x400$1')
+          : '';
+
         const xProfile: XUserProfile = {
           xId: String(xUser.id),
           username: xUser.username,
           name: xUser.name || xUser.username,
-          avatarUrl: xUser.profile_image_url || '',
-          profileUrl: `https://twitter.com/${xUser.username}`,
+          avatarUrl: hiResAvatar,
+          profileUrl: `https://x.com/${xUser.username}`,
         };
 
         const customToken = createFirebaseCustomToken(`x_${xProfile.xId}`, {
@@ -1643,12 +1757,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           username: xProfile.username,
         });
 
-        const sessionToken = signSessionPayload({
-          steamId: `x_${xProfile.xId}`,
-          personaName: xProfile.name,
-          avatarUrl: xProfile.avatarUrl,
-          profileUrl: xProfile.profileUrl,
-        });
+        const sessionToken = signSessionPayload(xProfile);
 
         sendHtml(
           res,
@@ -1666,7 +1775,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             'Авторизация через X успешно завершена. Окно сейчас закроется.',
             true,
             xProfile.avatarUrl
-          )
+          ),
+          {
+            'Set-Cookie': buildCookieHeader(X_COOKIE_NAME, sessionToken, SESSION_MAX_AGE_SECONDS, httpsFlag),
+          }
         );
       } catch (err: any) {
         console.error('[X Auth] Callback error:', err);
@@ -1682,6 +1794,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           )
         );
       }
+      return;
+    }
+
+    // 16a. X Session Check & Logout
+    if (pathname === '/api/auth/x/session' && method === 'GET') {
+      const profile = extractXSessionProfile(req);
+      if (!profile) {
+        sendJson(res, 200, { authenticated: false });
+        return;
+      }
+      const customToken = createFirebaseCustomToken(`x_${profile.xId}`, {
+        provider: 'x',
+        xId: profile.xId,
+        username: profile.username,
+      });
+      sendJson(res, 200, {
+        authenticated: true,
+        xProfile: profile,
+        customToken,
+        sessionToken: signSessionPayload(profile),
+        firebaseCustomAuthReady: Boolean(customToken),
+      });
+      return;
+    }
+
+    if (pathname === '/api/auth/x/logout' && (method === 'POST' || method === 'GET')) {
+      sendJson(res, 200, { ok: true }, { 'Set-Cookie': buildClearSessionCookieHeaders(httpsFlag, [X_COOKIE_NAME]) });
       return;
     }
 

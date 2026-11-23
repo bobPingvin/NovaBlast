@@ -22,7 +22,7 @@ import { XIcon } from './components/XIcon';
 import { ToolType, GridState, HistoryState, Project, HotkeyConfig, ProjectType, ExtendedUser } from './types';
 import { INITIAL_COLOR, DEFAULT_HOTKEYS } from './constants';
 import { Language, getTranslation } from './src/l10n';
-import { auth, db, googleProvider, githubProvider, signInWithPopup, signInWithCustomToken, signOut, onAuthStateChanged, User, collection, doc, setDoc, getDocs, updateDoc, deleteDoc, query, where, orderBy, Timestamp, handleFirestoreError, OperationType, getDoc, signInWithEmailAndPassword, createUserWithEmailAndPassword, updateProfile } from './src/lib/firebase';
+import { auth, db, googleProvider, githubProvider, twitterProvider, signInWithPopup, signInWithCustomToken, signOut, onAuthStateChanged, User, collection, doc, setDoc, getDocs, updateDoc, deleteDoc, query, where, orderBy, Timestamp, handleFirestoreError, OperationType, getDoc, signInWithEmailAndPassword, createUserWithEmailAndPassword, updateProfile } from './src/lib/firebase';
 import { signInWithCredential, GoogleAuthProvider } from 'firebase/auth';
 
 interface SteamSessionUser {
@@ -118,7 +118,8 @@ const App: React.FC = () => {
   const [isSteamLoggingIn, setIsSteamLoggingIn] = useState(false);
   const [isGithubLoggingIn, setIsGithubLoggingIn] = useState(false);
   const [isXLoggingIn, setIsXLoggingIn] = useState(false);
-  const activeUser: ExtendedUser | null = user || (steamSessionUser as unknown as ExtendedUser | null) || (githubSessionUser as unknown as ExtendedUser | null) || (xSessionUser as unknown as ExtendedUser | null);
+  const socialSessionUser = steamSessionUser || githubSessionUser || xSessionUser;
+  const activeUser: ExtendedUser | null = user || (socialSessionUser as unknown as ExtendedUser | null);
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [isProjectsModalOpen, setIsProjectsModalOpen] = useState(false);
@@ -855,55 +856,108 @@ const App: React.FC = () => {
   const authEpochRef = useRef(0);
   const hasAttemptedSteamRestoreRef = useRef(false);
 
-  // Restore verified Steam server session once on startup (works via Bearer token even if 3P cookies are blocked)
+  // Restore verified Steam / GitHub / X server sessions once on startup
   useEffect(() => {
     if (!isAuthReady || user || hasAttemptedSteamRestoreRef.current) return;
     hasAttemptedSteamRestoreRef.current = true;
 
     const restoreEpoch = authEpochRef.current;
     let cancelled = false;
-    const restoreSteamSession = async () => {
+    const restoreSocialSessions = async () => {
       try {
-        let savedToken: string | null = null;
+        let savedSteamToken: string | null = null;
+        let savedGithubToken: string | null = null;
+        let savedXToken: string | null = null;
         try {
-          savedToken = localStorage.getItem('novablast_steam_token');
+          savedSteamToken = localStorage.getItem('novablast_steam_token');
+          savedGithubToken = localStorage.getItem('novablast_github_token');
+          savedXToken = localStorage.getItem('novablast_x_token');
         } catch {}
 
-        const headers: Record<string, string> = {};
-        if (savedToken) {
-          headers.Authorization = `Bearer ${savedToken}`;
-        }
+        // 1. Steam session restore
+        try {
+          const headers: Record<string, string> = {};
+          if (savedSteamToken) headers.Authorization = `Bearer ${savedSteamToken}`;
+          const resp = await fetch('/api/auth/steam/session', {
+            credentials: 'include',
+            headers,
+            cache: 'no-store',
+          });
+          if (resp.ok && !cancelled && restoreEpoch === authEpochRef.current) {
+            const data = await resp.json();
+            if (!cancelled && restoreEpoch === authEpochRef.current && data?.authenticated && data?.steamProfile) {
+              await completeSteamAuth(
+                data.customToken || null,
+                data.steamProfile,
+                data.sessionToken || savedSteamToken,
+                true
+              );
+              return;
+            } else if (!cancelled && savedSteamToken && data?.authenticated === false) {
+              try { localStorage.removeItem('novablast_steam_token'); } catch {}
+            }
+          }
+        } catch {}
 
-        const resp = await fetch('/api/auth/steam/session', {
-          credentials: 'include',
-          headers,
-          cache: 'no-store',
-        });
-        if (!resp.ok) return;
-        if (cancelled || restoreEpoch !== authEpochRef.current) return;
-        const data = await resp.json();
-        if (!cancelled && restoreEpoch === authEpochRef.current && data?.authenticated && data?.steamProfile) {
-          await completeSteamAuth(
-            data.customToken || null,
-            data.steamProfile,
-            data.sessionToken || savedToken,
-            true
-          );
-        } else if (!cancelled && savedToken && data?.authenticated === false) {
-          try {
-            localStorage.removeItem('novablast_steam_token');
-          } catch {}
-        }
+        // 2. X (Twitter) session restore
+        try {
+          const headers: Record<string, string> = {};
+          if (savedXToken) headers.Authorization = `Bearer ${savedXToken}`;
+          const resp = await fetch('/api/auth/x/session', {
+            credentials: 'include',
+            headers,
+            cache: 'no-store',
+          });
+          if (resp.ok && !cancelled && restoreEpoch === authEpochRef.current) {
+            const data = await resp.json();
+            if (!cancelled && restoreEpoch === authEpochRef.current && data?.authenticated && data?.xProfile) {
+              await completeXAuth(
+                data.customToken || null,
+                data.xProfile,
+                data.sessionToken || savedXToken,
+                true
+              );
+              return;
+            } else if (!cancelled && savedXToken && data?.authenticated === false) {
+              try { localStorage.removeItem('novablast_x_token'); } catch {}
+            }
+          }
+        } catch {}
+
+        // 3. GitHub session restore
+        try {
+          const headers: Record<string, string> = {};
+          if (savedGithubToken) headers.Authorization = `Bearer ${savedGithubToken}`;
+          const resp = await fetch('/api/auth/github/session', {
+            credentials: 'include',
+            headers,
+            cache: 'no-store',
+          });
+          if (resp.ok && !cancelled && restoreEpoch === authEpochRef.current) {
+            const data = await resp.json();
+            if (!cancelled && restoreEpoch === authEpochRef.current && data?.authenticated && data?.githubProfile) {
+              await completeGithubAuth(
+                data.customToken || null,
+                data.githubProfile,
+                data.sessionToken || savedGithubToken,
+                true
+              );
+              return;
+            } else if (!cancelled && savedGithubToken && data?.authenticated === false) {
+              try { localStorage.removeItem('novablast_github_token'); } catch {}
+            }
+          }
+        } catch {}
       } catch {
         // Backend session endpoint unavailable or offline
       }
     };
 
-    restoreSteamSession();
+    restoreSocialSessions();
     return () => {
       cancelled = true;
     };
-  }, [isAuthReady, user, completeSteamAuth]);
+  }, [isAuthReady, user, completeSteamAuth, completeGithubAuth, completeXAuth]);
 
   // Fast-path listeners (postMessage + BroadcastChannel) alongside server polling
   useEffect(() => {
@@ -1526,23 +1580,42 @@ const App: React.FC = () => {
       const urlData = await urlResp.json();
 
       if (!urlData?.configured || !urlData?.url) {
-        setIsXLoggingIn(false);
-        toast.error(
-          language === 'en' ? 'X sign-in setup' : 'Настройка входа через X',
-          {
-            duration: 12000,
-            description: (
-              <div className="flex flex-col gap-2 mt-1">
-                <span>
-                  {language === 'en'
-                    ? `To enable X sign-in, set X_CLIENT_ID and X_CLIENT_SECRET environment variables in Vercel with callback URL: ${baseUrl}/auth/x/callback`
-                    : `Чтобы включить вход через X (Twitter), укажите X_CLIENT_ID и X_CLIENT_SECRET в переменных окружения Vercel и добавьте callback URL: ${baseUrl}/auth/x/callback`}
-                </span>
-              </div>
-            ),
+        // Fallback: try Firebase Auth Twitter/X provider if enabled in Firebase Console
+        try {
+          await signInWithPopup(auth, twitterProvider);
+          setIsXLoggingIn(false);
+          toast.success(language === 'en' ? 'Successfully signed in with X!' : 'Вы успешно вошли через X!');
+          return;
+        } catch (fbErr: any) {
+          setIsXLoggingIn(false);
+          if (fbErr?.code === 'auth/popup-closed-by-user' || fbErr?.code === 'auth/cancelled-popup-request') {
+            return;
           }
-        );
-        return;
+          toast.error(
+            language === 'en' ? 'X (Twitter) sign-in setup required' : 'Требуется настройка входа через X',
+            {
+              duration: 14000,
+              description: (
+                <div className="flex flex-col gap-2 mt-1">
+                  <span>
+                    {language === 'en'
+                      ? `Add X_CLIENT_ID (and X_CLIENT_SECRET for Web App) in Vercel Environment Variables with Callback URL: ${baseUrl}/auth/x/callback`
+                      : `Укажите X_CLIENT_ID (и X_CLIENT_SECRET для Web App) в Vercel → Settings → Environment Variables и добавьте Callback URL в X Developer Portal: ${baseUrl}/auth/x/callback`}
+                  </span>
+                  <a
+                    href="https://developer.x.com/en/portal/dashboard"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-sky-400 hover:text-sky-300 underline font-mono"
+                  >
+                    {language === 'en' ? 'Open X Developer Portal ↗' : 'Открыть X Developer Portal ↗'}
+                  </a>
+                </div>
+              ),
+            }
+          );
+          return;
+        }
       }
 
       const authWindow = window.open(
@@ -1647,17 +1720,45 @@ const App: React.FC = () => {
         } catch {}
       }, 1200);
 
-      toast.info(
-        language === 'en' ? 'Waiting for X authorization...' : 'Ожидание входа в окне X...',
-        {
-          id: 'x-login-pending',
-          duration: 15000,
-          description:
-            language === 'en'
-              ? 'Complete sign-in in the X window that opened.'
-              : 'Подтвердите вход в открывшемся окне X.',
-        }
-      );
+      if (!authWindow && !window.electron) {
+        toast.info(
+          language === 'en' ? 'Open X Sign-In' : 'Откройте страницу входа X',
+          {
+            id: 'x-login-pending',
+            duration: 30000,
+            description: (
+              <div className="mt-2 flex flex-col gap-2">
+                <span>
+                  {language === 'en'
+                    ? 'Your browser blocked the popup window. Click the button below to sign in via X in a new tab:'
+                    : 'Браузер заблокировал всплывающее окно. Нажмите кнопку ниже, чтобы войти через X в новой вкладке:'}
+                </span>
+                <a
+                  href={urlData.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-black hover:bg-neutral-900 text-white font-bold text-xs border border-white/20 transition-colors no-underline"
+                >
+                  <XIcon className="w-3.5 h-3.5" />
+                  <span>{language === 'en' ? 'Open X Login ↗' : 'Открыть вход X ↗'}</span>
+                </a>
+              </div>
+            ),
+          }
+        );
+      } else {
+        toast.info(
+          language === 'en' ? 'Waiting for X authorization...' : 'Ожидание входа в окне X...',
+          {
+            id: 'x-login-pending',
+            duration: 15000,
+            description:
+              language === 'en'
+                ? 'Complete sign-in in the X window that opened.'
+                : 'Подтвердите вход в открывшемся окне X.',
+          }
+        );
+      }
     } catch (err: any) {
       console.error('[X Auth] Failed to start backend OAuth:', err);
       setIsXLoggingIn(false);
@@ -1708,15 +1809,15 @@ const App: React.FC = () => {
 
   // Silent user project pre-fetcher to keep savedProjects updated without opening modals
   const fetchUserProjectsSilent = useCallback(async () => {
-    if (!user && steamSessionUser) {
+    if (!user && socialSessionUser) {
       try {
-        const storageKey = `novablast_projects_${steamSessionUser.uid}`;
+        const storageKey = `novablast_projects_${socialSessionUser.uid}`;
         const raw = localStorage.getItem(storageKey);
         const list: Project[] = raw ? JSON.parse(raw) : [];
         list.sort((a, b) => (b.updatedAt?.seconds || 0) - (a.updatedAt?.seconds || 0));
         setSavedProjects(list);
       } catch (err) {
-        console.error('Failed to read local Steam projects:', err);
+        console.error('Failed to read local social projects:', err);
       }
       return;
     }
@@ -1760,7 +1861,7 @@ const App: React.FC = () => {
     } catch (err) {
       console.error('Silent fetch user projects failed:', err);
     }
-  }, [user, steamSessionUser]);
+  }, [user, socialSessionUser]);
 
   // Auto pre-fetch user projects whenever authenticated user changes
   useEffect(() => {
@@ -1796,14 +1897,14 @@ const App: React.FC = () => {
     };
   }, [projectStarted, activeUser, currentProjectId, currentProjectName, history.present, canvasSize, projectType, fps, frames, currentFrameIndex]);
 
-  // Firebase Firestore (with automatic local profile fallback for Steam sessions without FIREBASE_SERVICE_ACCOUNT)
+  // Firebase Firestore (with automatic local profile fallback for Steam/GitHub/X sessions without FIREBASE_SERVICE_ACCOUNT)
   const saveProject = async () => {
-    if (!user && !steamSessionUser) {
+    if (!user && !socialSessionUser) {
       console.warn("Cannot save: User not logged in");
       return;
     }
 
-    if (!user && steamSessionUser) {
+    if (!user && socialSessionUser) {
       setIsSaving(true);
       setSaveSuccess(false);
       try {
@@ -1832,7 +1933,7 @@ const App: React.FC = () => {
           });
         }
         const previewImage = canvas.toDataURL('image/png');
-        const storageKey = `novablast_projects_${steamSessionUser.uid}`;
+        const storageKey = `novablast_projects_${socialSessionUser.uid}`;
         const existingRaw = localStorage.getItem(storageKey);
         const existingList: Project[] = existingRaw ? JSON.parse(existingRaw) : [];
 
@@ -1842,9 +1943,9 @@ const App: React.FC = () => {
           grid: JSON.stringify(history.present),
           width: canvasSize.width,
           height: canvasSize.height,
-          userId: steamSessionUser.uid,
-          ownerName: steamSessionUser.displayName,
-          ownerEmail: 'steam',
+          userId: socialSessionUser.uid,
+          ownerName: socialSessionUser.displayName,
+          ownerEmail: socialSessionUser.provider,
           previewImage,
           updatedAt: { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 },
           projectType,
@@ -1869,7 +1970,7 @@ const App: React.FC = () => {
           duration: 5000,
         });
       } catch (err: any) {
-        console.error('Local Steam save error:', err);
+        console.error('Local social save error:', err);
         toast.error(language === 'en' ? 'Failed to save project' : 'Не удалось сохранить проект', {
           description: err?.message || '',
         });
@@ -1971,18 +2072,18 @@ const App: React.FC = () => {
   };
 
   const loadProjects = async () => {
-    if (!user && steamSessionUser) {
+    if (!user && socialSessionUser) {
       setError(null);
       setIsProjectsModalOpen(true);
       setIsProjectsLoading(true);
       try {
-        const storageKey = `novablast_projects_${steamSessionUser.uid}`;
+        const storageKey = `novablast_projects_${socialSessionUser.uid}`;
         const raw = localStorage.getItem(storageKey);
         const list: Project[] = raw ? JSON.parse(raw) : [];
         list.sort((a, b) => (b.updatedAt?.seconds || 0) - (a.updatedAt?.seconds || 0));
         setSavedProjects(list);
       } catch (err) {
-        console.error('Failed to read local Steam projects:', err);
+        console.error('Failed to read local social projects:', err);
         setSavedProjects([]);
       } finally {
         setIsProjectsLoading(false);
@@ -2096,12 +2197,12 @@ const App: React.FC = () => {
 
   const handleDeleteProject = async (projectId: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if ((!user && !steamSessionUser) || isDeletingProject) return;
+    if ((!user && !socialSessionUser) || isDeletingProject) return;
     
     setIsDeletingProject(projectId);
     try {
-      if (!user && steamSessionUser) {
-        const storageKey = `novablast_projects_${steamSessionUser.uid}`;
+      if (!user && socialSessionUser) {
+        const storageKey = `novablast_projects_${socialSessionUser.uid}`;
         const raw = localStorage.getItem(storageKey);
         const list: Project[] = raw ? JSON.parse(raw) : [];
         const filtered = list.filter(p => p.id !== projectId);
@@ -2145,15 +2246,15 @@ const App: React.FC = () => {
 
   const handleRenameProject = async (projectId: string, e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if ((!user && !steamSessionUser) || !renamingName.trim()) {
+    if ((!user && !socialSessionUser) || !renamingName.trim()) {
       setRenamingProjectId(null);
       return;
     }
 
     try {
       const trimmed = renamingName.trim();
-      if (!user && steamSessionUser) {
-        const storageKey = `novablast_projects_${steamSessionUser.uid}`;
+      if (!user && socialSessionUser) {
+        const storageKey = `novablast_projects_${socialSessionUser.uid}`;
         const raw = localStorage.getItem(storageKey);
         const list: Project[] = raw ? JSON.parse(raw) : [];
         const updated = list.map(p =>
@@ -2415,14 +2516,14 @@ const App: React.FC = () => {
         }
       };
       loadHotkeys();
-    } else if (steamSessionUser) {
-      const saved = localStorage.getItem(`novablast_hotkeys_${steamSessionUser.uid}`) || localStorage.getItem('pixel_punk_hotkeys');
+    } else if (socialSessionUser) {
+      const saved = localStorage.getItem(`novablast_hotkeys_${socialSessionUser.uid}`) || localStorage.getItem('pixel_punk_hotkeys');
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
           setHotkeys({ ...DEFAULT_HOTKEYS, ...parsed });
         } catch (e) {
-          console.warn("Error parsing local Steam hotkeys:", e);
+          console.warn("Error parsing local social hotkeys:", e);
         }
       }
     } else {
@@ -2436,7 +2537,7 @@ const App: React.FC = () => {
         }
       }
     }
-  }, [user, steamSessionUser]);
+  }, [user, socialSessionUser]);
 
   const saveHotkeys = async (newHotkeys: HotkeyConfig, forceLang?: Language) => {
     const activeLang = forceLang || language;

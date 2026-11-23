@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, GithubAuthProvider, signInWithPopup, signInWithCustomToken, signOut, onAuthStateChanged, User, signInWithEmailAndPassword, createUserWithEmailAndPassword, updateProfile, sendPasswordResetEmail } from 'firebase/auth';
+import { getAuth, GoogleAuthProvider, GithubAuthProvider, TwitterAuthProvider, signInWithPopup, signInWithCustomToken, signOut, onAuthStateChanged, User, signInWithEmailAndPassword, createUserWithEmailAndPassword, updateProfile, sendPasswordResetEmail } from 'firebase/auth';
 import { initializeFirestore, getFirestore, setLogLevel, collection, doc, setDoc, getDoc, getDocFromServer, getDocs, updateDoc, deleteDoc, onSnapshot, query, where, orderBy, limit, Timestamp } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
@@ -36,6 +36,7 @@ googleProvider.setCustomParameters({ prompt: 'select_account' });
 export const githubProvider = new GithubAuthProvider();
 githubProvider.addScope('read:user');
 githubProvider.addScope('user:email');
+export const twitterProvider = new TwitterAuthProvider();
 
 const hasValidFirebaseConfig = Boolean(
   firebaseConfig?.projectId &&
@@ -145,6 +146,7 @@ export {
   signOut,
   onAuthStateChanged,
   GithubAuthProvider,
+  TwitterAuthProvider,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   updateProfile,
