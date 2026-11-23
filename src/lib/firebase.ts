@@ -18,11 +18,12 @@ const app = getApps().length ? getApp() : initializeApp(resolvedFirebaseConfig);
 // Set Firestore log level to silent to prevent benign transport logs from triggering console error listeners
 setLogLevel('silent');
 
-// Use WebChannel with automatic long-polling fallback (avoids forced long-polling stalls that trigger offline errors)
+// Use WebChannel with automatic long-polling fallback (and ignore undefined fields cleanly)
 export const db = (() => {
   try {
     return initializeFirestore(app, {
       experimentalAutoDetectLongPolling: true,
+      ignoreUndefinedProperties: true,
     }, firebaseConfig.firestoreDatabaseId);
   } catch {
     return getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -36,7 +37,19 @@ export const githubProvider = new GithubAuthProvider();
 githubProvider.addScope('read:user');
 githubProvider.addScope('user:email');
 
+const hasValidFirebaseConfig = Boolean(
+  firebaseConfig?.projectId &&
+  firebaseConfig.projectId !== 'remixed-project-id' &&
+  firebaseConfig?.apiKey &&
+  firebaseConfig?.firestoreDatabaseId
+);
+
 async function testConnection(retryCount = 0) {
+  if (!hasValidFirebaseConfig) {
+    console.error('Please check your Firebase configuration.');
+    return;
+  }
+
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     if (typeof window !== 'undefined') {
       window.addEventListener('online', () => {
@@ -50,13 +63,14 @@ async function testConnection(retryCount = 0) {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
     if (error instanceof Error && error.message.includes('the client is offline')) {
-      if (retryCount < 1) {
+      if (retryCount < 2) {
+        const delayMs = retryCount === 0 ? 2000 : 4000;
         setTimeout(() => {
           void testConnection(retryCount + 1);
-        }, 1500);
+        }, delayMs);
         return;
       }
-      console.error('Please check your Firebase configuration.');
+      console.warn('Firestore connection unavailable: client appears offline or Firestore transport is blocked by network/extensions.');
     }
   }
 }
