@@ -4,13 +4,22 @@ import { initializeFirestore, getFirestore, setLogLevel, collection, doc, setDoc
 import firebaseConfig from '../../firebase-applet-config.json';
 
 // Initialize Firebase SDK safely (prevents duplicate initialization during reloads)
-const customAuthDomain =
+const rawCustomAuthDomain =
   typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_AUTH_DOMAIN
     ? String(import.meta.env.VITE_FIREBASE_AUTH_DOMAIN).trim()
     : '';
 
-const resolvedFirebaseConfig = customAuthDomain
-  ? { ...firebaseConfig, authDomain: customAuthDomain }
+const normalizedCustomAuthDomain = rawCustomAuthDomain
+  .replace(/^https?:\/\//i, '')
+  .split('/')[0]
+  .trim();
+
+const shouldUseCustomAuthDomain =
+  Boolean(normalizedCustomAuthDomain) &&
+  (typeof window === 'undefined' || window.location.hostname === normalizedCustomAuthDomain);
+
+const resolvedFirebaseConfig = shouldUseCustomAuthDomain
+  ? { ...firebaseConfig, authDomain: normalizedCustomAuthDomain }
   : firebaseConfig;
 
 const app = getApps().length ? getApp() : initializeApp(resolvedFirebaseConfig);
