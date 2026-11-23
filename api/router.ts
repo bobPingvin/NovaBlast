@@ -2,11 +2,6 @@ import type { IncomingMessage, ServerResponse } from 'http';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { initializeApp as initAdminApp, getApps as getAdminApps, cert } from 'firebase-admin/app';
-import type { ServiceAccount } from 'firebase-admin/app';
-import { getAuth as getAdminAuth } from 'firebase-admin/auth';
-import type { Auth as AdminAuth } from 'firebase-admin/auth';
-import { GoogleGenAI } from '@google/genai';
 
 type VercelRequest = IncomingMessage & {
   query?: Record<string, string | string[] | undefined>;
@@ -19,23 +14,17 @@ const SESSION_COOKIE_NAME = 'novablast_steam_session';
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const CHALLENGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-let defaultFirebaseProjectId = process.env.FIREBASE_PROJECT_ID || '';
+let defaultFirebaseProjectId = process.env.FIREBASE_PROJECT_ID || 'gen-lang-client-0487154255';
 try {
-  const candidates = [
-    path.join(process.cwd(), 'firebase-applet-config.json'),
-    path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'firebase-applet-config.json'),
-  ];
-  for (const configPath of candidates) {
-    if (fs.existsSync(configPath)) {
-      const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      if (!defaultFirebaseProjectId && parsed.projectId) {
-        defaultFirebaseProjectId = parsed.projectId;
-        break;
-      }
+  const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
+  if (fs.existsSync(configPath)) {
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    if (parsed.projectId) {
+      defaultFirebaseProjectId = parsed.projectId;
     }
   }
 } catch {
-  // Ignore config read errors
+  // Fallback to defaultFirebaseProjectId
 }
 
 const SESSION_SECRET =
@@ -69,56 +58,78 @@ interface XUserProfile {
   profileUrl: string;
 }
 
-let cachedAdminAuth: AdminAuth | null | undefined;
+interface ServiceAccountCreds {
+  clientEmail: string;
+  privateKey: string;
+}
 
-function getFirebaseAdmin(): AdminAuth | null {
-  if (cachedAdminAuth !== undefined) {
-    return cachedAdminAuth;
+let cachedServiceAccount: ServiceAccountCreds | null | undefined;
+
+function getServiceAccountCreds(): ServiceAccountCreds | null {
+  if (cachedServiceAccount !== undefined) {
+    return cachedServiceAccount;
   }
 
   try {
-    const existingApps = getAdminApps();
-    if (existingApps.length > 0) {
-      cachedAdminAuth = getAdminAuth(existingApps[0]);
-      return cachedAdminAuth;
-    }
-
-    let serviceAccount: ServiceAccount | null = null;
     const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT?.trim();
-
     if (rawServiceAccount) {
       let jsonStr = rawServiceAccount;
       if (!rawServiceAccount.startsWith('{')) {
         jsonStr = Buffer.from(rawServiceAccount, 'base64').toString('utf-8');
       }
       const parsed = JSON.parse(jsonStr);
-      serviceAccount = {
-        projectId: parsed.project_id || parsed.projectId || defaultFirebaseProjectId,
-        clientEmail: parsed.client_email || parsed.clientEmail,
-        privateKey: (parsed.private_key || parsed.privateKey || '').replace(/\\n/g, '\n'),
-      };
+      const clientEmail = String(parsed.client_email || parsed.clientEmail || '').trim();
+      const privateKey = String(parsed.private_key || parsed.privateKey || '').replace(/\\n/g, '\n');
+      if (clientEmail && privateKey) {
+        cachedServiceAccount = { clientEmail, privateKey };
+        return cachedServiceAccount;
+      }
     } else if (process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
-      serviceAccount = {
-        projectId: process.env.FIREBASE_PROJECT_ID || defaultFirebaseProjectId,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL.trim(),
-        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      };
-    }
-
-    if (serviceAccount && serviceAccount.clientEmail && serviceAccount.privateKey) {
-      const adminApp = initAdminApp({
-        credential: cert(serviceAccount),
-        projectId: serviceAccount.projectId || defaultFirebaseProjectId,
-      });
-      cachedAdminAuth = getAdminAuth(adminApp);
-      return cachedAdminAuth;
+      const clientEmail = process.env.FIREBASE_CLIENT_EMAIL.trim();
+      const privateKey = process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n');
+      if (clientEmail && privateKey) {
+        cachedServiceAccount = { clientEmail, privateKey };
+        return cachedServiceAccount;
+      }
     }
   } catch (err) {
-    console.error('[Vercel Auth] Failed to initialize Firebase Admin SDK:', err);
+    console.error('[Vercel Auth] Failed to parse Firebase service account:', err);
   }
 
-  cachedAdminAuth = null;
+  cachedServiceAccount = null;
   return null;
+}
+
+// Pure Node crypto RS256 Firebase Custom Token generator (zero external dependencies)
+function createFirebaseCustomToken(uid: string, claims?: Record<string, unknown>): string | null {
+  const creds = getServiceAccountCreds();
+  if (!creds) return null;
+
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' }), 'utf-8').toString('base64url');
+    const payloadObj: Record<string, unknown> = {
+      iss: creds.clientEmail,
+      sub: creds.clientEmail,
+      aud: 'https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit',
+      iat: now,
+      exp: now + 3600,
+      uid,
+    };
+    if (claims && Object.keys(claims).length > 0) {
+      payloadObj.claims = claims;
+    }
+    const payload = Buffer.from(JSON.stringify(payloadObj), 'utf-8').toString('base64url');
+    const signingInput = `${header}.${payload}`;
+    const signer = crypto.createSign('RSA-SHA256');
+    signer.update(signingInput);
+    signer.end();
+    const signature = signer.sign(creds.privateKey).toString('base64url');
+    return `${signingInput}.${signature}`;
+  } catch (err) {
+    console.error('[Vercel Auth] Failed to sign Firebase custom token:', err);
+    return null;
+  }
 }
 
 function getQueryString(params: URLSearchParams, key: string): string {
@@ -703,182 +714,596 @@ function renderPopupCallbackHtml(
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const rawUrl = req.url || '/';
-  const parsed = new URL(rawUrl, 'http://localhost');
-  const queryParams = parsed.searchParams;
+  try {
+    const rawUrl = req.url || '/';
+    const parsed = new URL(rawUrl, 'http://localhost');
+    const queryParams = new URLSearchParams(parsed.searchParams);
 
-  // Vercel rewrite passes ?__route=/api/... or ?__route=/auth/...
-  const routeOverride = queryParams.get('__route');
-  const pathname = (routeOverride ? routeOverride.split('?')[0] : parsed.pathname).replace(/\/+$/, '') || '/';
-  const method = (req.method || 'GET').toUpperCase();
-  const baseUrl = resolveBaseUrl(req, queryParams);
-  const httpsFlag = isRequestHttps(req);
-
-  // 1. Steam OpenID URL
-  if (pathname === '/api/auth/steam/url' && method === 'GET') {
-    const rawLoginId = getQueryString(queryParams, 'loginId').trim();
-    const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId) ? rawLoginId : crypto.randomUUID();
-    const callbackUrl = `${baseUrl}/auth/steam/callback/${loginId}`;
-
-    const params = new URLSearchParams({
-      'openid.ns': 'http://specs.openid.net/auth/2.0',
-      'openid.mode': 'checkid_setup',
-      'openid.return_to': callbackUrl,
-      'openid.realm': baseUrl,
-      'openid.identity': 'http://specs.openid.net/auth/2.0/identifier_select',
-      'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select',
-    });
-
-    sendJson(res, 200, {
-      url: `https://steamcommunity.com/openid/login?${params.toString()}`,
-      callbackUrl,
-      loginId,
-    });
-    return;
-  }
-
-  // 2. Steam QR Begin
-  if (pathname === '/api/auth/steam/qr/begin' && method === 'POST') {
-    try {
-      const resp = await fetch('https://api.steampowered.com/IAuthenticationService/BeginAuthSessionViaQR/v1/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ device_friendly_name: 'NovaBlast App' }).toString(),
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!resp.ok) {
-        throw new Error(`Steam QR API returned ${resp.status}`);
+    if (req.query) {
+      for (const [k, v] of Object.entries(req.query)) {
+        if (!queryParams.has(k) && v !== undefined) {
+          queryParams.set(k, Array.isArray(v) ? String(v[0] ?? '') : String(v));
+        }
       }
-      const data = (await resp.json()) as {
-        response?: {
-          client_id?: string;
-          challenge_url?: string;
-          request_id?: string;
-          interval?: number;
-        };
-      };
-      const r = data.response;
-      if (!r?.client_id || !r?.challenge_url || !r?.request_id) {
-        throw new Error('Invalid response from Steam QR API');
-      }
-      const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&margin=10&data=${encodeURIComponent(
-        r.challenge_url
-      )}`;
-      sendJson(res, 200, {
-        success: true,
-        clientId: r.client_id,
-        requestId: r.request_id,
-        challengeUrl: r.challenge_url,
-        qrImageUrl,
-        interval: r.interval || 4,
-      });
-    } catch (err) {
-      console.error('[Steam Auth] QR begin error:', err);
-      sendJson(res, 500, { success: false, error: 'Не удалось начать QR-авторизацию Steam.' });
     }
-    return;
-  }
 
-  // 3. Steam QR Poll
-  if (pathname === '/api/auth/steam/qr/poll' && method === 'POST') {
-    const body = await readJsonBody(req);
-    const clientId = typeof body?.clientId === 'string' ? body.clientId.trim() : '';
-    const requestId = typeof body?.requestId === 'string' ? body.requestId.trim() : '';
+    const routeOverride = queryParams.get('__route') || '';
+    const pathname = (routeOverride ? routeOverride.split('?')[0] : parsed.pathname).replace(/\/+$/, '') || '/';
+    const method = (req.method || 'GET').toUpperCase();
+    const baseUrl = resolveBaseUrl(req, queryParams);
+    const httpsFlag = isRequestHttps(req);
 
-    if (!clientId || !requestId) {
-      sendJson(res, 400, { authenticated: false, error: 'Отсутствует clientId или requestId' });
+    // 1. Steam OpenID URL
+    if (pathname === '/api/auth/steam/url' && method === 'GET') {
+      const rawLoginId = getQueryString(queryParams, 'loginId').trim();
+      const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId) ? rawLoginId : crypto.randomUUID();
+      const callbackUrl = `${baseUrl}/auth/steam/callback/${loginId}`;
+
+      const params = new URLSearchParams({
+        'openid.ns': 'http://specs.openid.net/auth/2.0',
+        'openid.mode': 'checkid_setup',
+        'openid.return_to': callbackUrl,
+        'openid.realm': baseUrl,
+        'openid.identity': 'http://specs.openid.net/auth/2.0/identifier_select',
+        'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select',
+      });
+
+      sendJson(res, 200, {
+        url: `https://steamcommunity.com/openid/login?${params.toString()}`,
+        callbackUrl,
+        loginId,
+      });
       return;
     }
 
-    try {
-      const resp = await fetch('https://api.steampowered.com/IAuthenticationService/PollAuthSessionStatus/v1/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ client_id: clientId, request_id: requestId }).toString(),
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!resp.ok) {
-        sendJson(res, 200, { authenticated: false, status: 'pending' });
+    // 2. Steam QR Begin
+    if (pathname === '/api/auth/steam/qr/begin' && method === 'POST') {
+      try {
+        const resp = await fetch('https://api.steampowered.com/IAuthenticationService/BeginAuthSessionViaQR/v1/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ device_friendly_name: 'NovaBlast App' }).toString(),
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!resp.ok) {
+          throw new Error(`Steam QR API returned ${resp.status}`);
+        }
+        const data = (await resp.json()) as {
+          response?: {
+            client_id?: string;
+            challenge_url?: string;
+            request_id?: string;
+            interval?: number;
+          };
+        };
+        const r = data.response;
+        if (!r?.client_id || !r?.challenge_url || !r?.request_id) {
+          throw new Error('Invalid response from Steam QR API');
+        }
+        const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&margin=10&data=${encodeURIComponent(
+          r.challenge_url
+        )}`;
+        sendJson(res, 200, {
+          success: true,
+          clientId: r.client_id,
+          requestId: r.request_id,
+          challengeUrl: r.challenge_url,
+          qrImageUrl,
+          interval: r.interval || 4,
+        });
+      } catch (err) {
+        console.error('[Steam Auth] QR begin error:', err);
+        sendJson(res, 500, { success: false, error: 'Не удалось начать QR-авторизацию Steam.' });
+      }
+      return;
+    }
+
+    // 3. Steam QR Poll
+    if (pathname === '/api/auth/steam/qr/poll' && method === 'POST') {
+      const body = await readJsonBody(req);
+      const clientId = typeof body?.clientId === 'string' ? body.clientId.trim() : '';
+      const requestId = typeof body?.requestId === 'string' ? body.requestId.trim() : '';
+
+      if (!clientId || !requestId) {
+        sendJson(res, 400, { authenticated: false, error: 'Отсутствует clientId или requestId' });
         return;
       }
-      const data = (await resp.json()) as {
-        response?: {
-          steamid?: string;
-          had_remote_interaction?: boolean;
+
+      try {
+        const resp = await fetch('https://api.steampowered.com/IAuthenticationService/PollAuthSessionStatus/v1/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ client_id: clientId, request_id: requestId }).toString(),
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!resp.ok) {
+          sendJson(res, 200, { authenticated: false, status: 'pending' });
+          return;
+        }
+        const data = (await resp.json()) as {
+          response?: {
+            steamid?: string;
+            had_remote_interaction?: boolean;
+          };
         };
-      };
-      const r = data.response;
-      if (!r?.steamid) {
+        const r = data.response;
+        if (!r?.steamid) {
+          sendJson(res, 200, {
+            authenticated: false,
+            status: 'pending',
+            hadRemoteInteraction: Boolean(r?.had_remote_interaction),
+          });
+          return;
+        }
+
+        const steamId = r.steamid;
+        const steamProfile = await fetchSteamProfile(steamId);
+        const signedSession = signSessionPayload(steamProfile);
+        const customToken = createFirebaseCustomToken(`steam_${steamId}`, {
+          steamId,
+          provider: 'steam',
+          personaName: steamProfile.personaName,
+        });
+
+        sendJson(
+          res,
+          200,
+          {
+            authenticated: true,
+            status: 'authenticated',
+            steamProfile,
+            customToken,
+            sessionToken: signedSession,
+            firebaseCustomAuthReady: Boolean(customToken),
+          },
+          {
+            'Set-Cookie': buildSessionCookieHeader(signedSession, SESSION_MAX_AGE_SECONDS, httpsFlag),
+          }
+        );
+      } catch (err) {
+        console.error('[Steam Auth] QR poll error:', err);
+        sendJson(res, 500, { authenticated: false, error: 'Ошибка опроса сессии Steam QR.' });
+      }
+      return;
+    }
+
+    // 4. Steam Poll (serverless stateless stub)
+    if (pathname.startsWith('/api/auth/steam/poll')) {
+      sendJson(res, 200, { status: 'pending' });
+      return;
+    }
+
+    // 5. Steam OpenID Callback
+    if (pathname.startsWith('/auth/steam/callback') || pathname.startsWith('/api/auth/steam/callback')) {
+      const segs = pathname.split('/').filter(Boolean);
+      const maybeLoginId = segs[segs.length - 1] !== 'callback' ? segs[segs.length - 1] : '';
+      const rawLoginId = maybeLoginId || getQueryString(queryParams, 'loginId');
+      const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId.trim()) ? rawLoginId.trim() : '';
+
+      try {
+        const mode = getQueryString(queryParams, 'openid.mode');
+        if (mode !== 'id_res') {
+          const cancelMsg = 'Вход через Steam был отменён.';
+          sendHtml(
+            res,
+            400,
+            renderPopupCallbackHtml(
+              { type: 'STEAM_AUTH_ERROR', loginId, error: cancelMsg },
+              'Вход отменён',
+              'Вы можете закрыть это окно и вернуться в NovaBlast.',
+              false
+            )
+          );
+          return;
+        }
+
+        const isValid = await verifySteamOpenIdParams(queryParams);
+        if (!isValid) {
+          const invalidMsg = 'Не удалось подтвердить подпись ответа Steam OpenID.';
+          sendHtml(
+            res,
+            401,
+            renderPopupCallbackHtml(
+              { type: 'STEAM_AUTH_ERROR', loginId, error: invalidMsg },
+              'Ошибка проверки Steam',
+              'Подпись ответа не прошла валидацию. Закройте окно и попробуйте войти снова.',
+              false
+            )
+          );
+          return;
+        }
+
+        const claimedId = getQueryString(queryParams, 'openid.claimed_id');
+        const idMatch = claimedId.match(/^https?:\/\/steamcommunity\.com\/openid\/id\/(\d{17,25})$/);
+        if (!idMatch) {
+          const formatMsg = 'Некорректный формат идентификатора SteamID.';
+          sendHtml(
+            res,
+            400,
+            renderPopupCallbackHtml(
+              { type: 'STEAM_AUTH_ERROR', loginId, error: formatMsg },
+              'Ошибка SteamID',
+              'Не удалось определить SteamID из ответа Steam.',
+              false
+            )
+          );
+          return;
+        }
+
+        const steamId = idMatch[1];
+        const steamProfile = await fetchSteamProfile(steamId);
+        const signedSession = signSessionPayload(steamProfile);
+        const customToken = createFirebaseCustomToken(`steam_${steamId}`, {
+          steamId,
+          provider: 'steam',
+          personaName: steamProfile.personaName,
+        });
+
+        sendHtml(
+          res,
+          200,
+          renderPopupCallbackHtml(
+            {
+              type: 'STEAM_AUTH_SUCCESS',
+              loginId,
+              steamProfile,
+              customToken,
+              sessionToken: signedSession,
+              firebaseCustomAuthReady: Boolean(customToken),
+            },
+            `Привет, ${steamProfile.personaName}!`,
+            'Вход через Steam выполнен. Это окно автоматически закроется.',
+            true,
+            steamProfile.avatarUrl
+          ),
+          {
+            'Set-Cookie': buildSessionCookieHeader(signedSession, SESSION_MAX_AGE_SECONDS, httpsFlag),
+          }
+        );
+      } catch (err) {
+        console.error('[Steam Auth] Callback error:', err);
+        const errMsg = 'Внутренняя ошибка сервера при проверке входа Steam.';
+        sendHtml(
+          res,
+          500,
+          renderPopupCallbackHtml(
+            { type: 'STEAM_AUTH_ERROR', loginId, error: errMsg },
+            'Ошибка входа',
+            errMsg,
+            false
+          )
+        );
+      }
+      return;
+    }
+
+    // 6. Steam Manual Callback Recovery
+    if (pathname === '/api/auth/steam/manual-callback' && method === 'POST') {
+      const body = await readJsonBody(req);
+      const rawUrl = typeof body?.url === 'string' ? body.url.trim() : '';
+      if (!rawUrl) {
+        sendJson(res, 400, { authenticated: false, error: 'Вставьте ссылку из адресной строки окна с ошибкой.' });
+        return;
+      }
+
+      try {
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(rawUrl);
+        } catch {
+          sendJson(res, 400, { authenticated: false, error: 'Некорректная ссылка. Скопируйте весь URL из адресной строки.' });
+          return;
+        }
+
+        if (parsedUrl.searchParams.get('openid.mode') !== 'id_res') {
+          sendJson(res, 400, { authenticated: false, error: 'В этой ссылке отсутствуют параметры ответа Steam (openid.mode=id_res).' });
+          return;
+        }
+
+        const isValid = await verifySteamOpenIdParams(parsedUrl.searchParams);
+        if (!isValid) {
+          sendJson(res, 401, { authenticated: false, error: 'Подпись ответа Steam OpenID недействительна или уже устарела.' });
+          return;
+        }
+
+        const claimedId = parsedUrl.searchParams.get('openid.claimed_id') || '';
+        const idMatch = claimedId.match(/^https?:\/\/steamcommunity\.com\/openid\/id\/(\d{17,25})$/);
+        if (!idMatch) {
+          sendJson(res, 400, { authenticated: false, error: 'Не удалось извлечь SteamID из ссылки.' });
+          return;
+        }
+
+        const steamId = idMatch[1];
+        const steamProfile = await fetchSteamProfile(steamId);
+        const signedSession = signSessionPayload(steamProfile);
+        const customToken = createFirebaseCustomToken(`steam_${steamId}`, {
+          steamId,
+          provider: 'steam',
+          personaName: steamProfile.personaName,
+        });
+
+        sendJson(
+          res,
+          200,
+          {
+            authenticated: true,
+            steamProfile,
+            customToken,
+            sessionToken: signedSession,
+            firebaseCustomAuthReady: Boolean(customToken),
+          },
+          {
+            'Set-Cookie': buildSessionCookieHeader(signedSession, SESSION_MAX_AGE_SECONDS, httpsFlag),
+          }
+        );
+      } catch (err) {
+        console.error('[Steam Auth] Manual callback error:', err);
+        sendJson(res, 500, { authenticated: false, error: 'Внутренняя ошибка при обработке ссылки Steam.' });
+      }
+      return;
+    }
+
+    // 7. Steam Session Check
+    if (pathname === '/api/auth/steam/session' && method === 'GET') {
+      const profile = extractSessionProfile(req);
+      if (!profile) {
+        sendJson(res, 200, { authenticated: false });
+        return;
+      }
+
+      const customToken = createFirebaseCustomToken(`steam_${profile.steamId}`, {
+        steamId: profile.steamId,
+        provider: 'steam',
+        personaName: profile.personaName,
+      });
+
+      sendJson(res, 200, {
+        authenticated: true,
+        steamProfile: profile,
+        customToken,
+        sessionToken: signSessionPayload(profile),
+        firebaseCustomAuthReady: Boolean(customToken),
+      });
+      return;
+    }
+
+    // 8. Steam Logout
+    if (pathname === '/api/auth/steam/logout' && method === 'POST') {
+      sendJson(
+        res,
+        200,
+        { ok: true },
+        {
+          'Set-Cookie': buildSessionCookieHeader('', 0, httpsFlag),
+        }
+      );
+      return;
+    }
+
+    // 9. Steam Profile Ownership Challenge
+    if (pathname === '/api/auth/steam/challenge' && method === 'POST') {
+      const body = await readJsonBody(req);
+      const queryStr = typeof body?.query === 'string' ? body.query.trim() : '';
+      if (!queryStr) {
+        sendJson(res, 400, { success: false, error: 'Укажите никнейм, ссылку на профиль или SteamID.' });
+        return;
+      }
+
+      try {
+        const profile = await resolveSteamProfileInput(queryStr);
+        if (!profile) {
+          sendJson(res, 404, {
+            success: false,
+            error: 'Профиль Steam не найден. Убедитесь, что ник или ссылка верны, а профиль открыт для сообщества.',
+          });
+          return;
+        }
+
+        const randomHex = crypto.randomBytes(3).toString('hex').toUpperCase();
+        const challengeCode = `NOVA-${randomHex}`;
+        const expiresAt = Date.now() + CHALLENGE_TTL_MS;
+        const challengeToken = signTokenPayload(
+          { steamId: profile.steamId, code: challengeCode, expiresAt },
+          Math.ceil(CHALLENGE_TTL_MS / 1000)
+        );
+
         sendJson(res, 200, {
+          success: true,
+          profile,
+          challengeCode,
+          challengeToken,
+          expiresAt,
+        });
+      } catch (err) {
+        console.error('[Steam Auth] Challenge error:', err);
+        sendJson(res, 500, { success: false, error: 'Ошибка сервера при поиске профиля Steam.' });
+      }
+      return;
+    }
+
+    // 10. Verify Steam Challenge
+    if (pathname === '/api/auth/steam/verify-challenge' && method === 'POST') {
+      const body = await readJsonBody(req);
+      const steamId = typeof body?.steamId === 'string' ? body.steamId.trim() : '';
+      const inputCode = typeof body?.challengeCode === 'string' ? body.challengeCode.trim() : '';
+      const challengeToken = typeof body?.challengeToken === 'string' ? body.challengeToken.trim() : '';
+
+      if (!steamId || !inputCode || !challengeToken) {
+        sendJson(res, 400, { authenticated: false, error: 'Не указан SteamID, токен или проверочный код.' });
+        return;
+      }
+
+      const tokenRecord = verifyTokenPayload<{ steamId: string; code: string; expiresAt: number }>(challengeToken);
+      if (!tokenRecord || tokenRecord.steamId !== steamId || Date.now() > tokenRecord.expiresAt) {
+        sendJson(res, 400, {
           authenticated: false,
-          status: 'pending',
-          hadRemoteInteraction: Boolean(r?.had_remote_interaction),
+          error: 'Срок действия кода проверки истек или запрос не найден. Запросите новый код.',
         });
         return;
       }
 
-      const steamId = r.steamid;
-      const steamProfile = await fetchSteamProfile(steamId);
-      const signedSession = signSessionPayload(steamProfile);
-
-      let customToken: string | null = null;
-      const adminAuth = getFirebaseAdmin();
-      if (adminAuth) {
-        try {
-          customToken = await adminAuth.createCustomToken(`steam_${steamId}`, {
-            steamId,
-            provider: 'steam',
-            personaName: steamProfile.personaName,
-          });
-        } catch (tokenErr) {
-          console.error('[Steam Auth] QR custom token error:', tokenErr);
-        }
+      const normExpected = tokenRecord.code.toUpperCase();
+      const normInput = inputCode.toUpperCase();
+      const rawPart = tokenRecord.code.split('-')[1] || '';
+      if (normInput !== normExpected && !normInput.endsWith(rawPart)) {
+        sendJson(res, 400, { authenticated: false, error: 'Введен неверный проверочный код.' });
+        return;
       }
 
-      sendJson(
-        res,
-        200,
-        {
-          authenticated: true,
-          status: 'authenticated',
-          steamProfile,
-          customToken,
-          sessionToken: signedSession,
-          firebaseCustomAuthReady: Boolean(customToken),
-        },
-        {
-          'Set-Cookie': buildSessionCookieHeader(signedSession, SESSION_MAX_AGE_SECONDS, httpsFlag),
+      try {
+        let liveXml = '';
+        const xmlUrl = `https://steamcommunity.com/profiles/${encodeURIComponent(steamId)}/?xml=1&_t=${Date.now()}`;
+        try {
+          const xmlResp = await fetch(xmlUrl, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) NovaBlast/1.0',
+              Accept: 'application/xml,text/xml,*/*',
+              'Cache-Control': 'no-cache, no-store',
+            },
+            signal: AbortSignal.timeout(8000),
+          });
+          if (xmlResp.ok) {
+            liveXml = await xmlResp.text();
+          }
+        } catch {}
+
+        const summary = (extractXmlTag(liveXml, 'summary') || '').toLowerCase();
+        const realname = (extractXmlTag(liveXml, 'realname') || '').toLowerCase();
+        const headline = (extractXmlTag(liveXml, 'headline') || '').toLowerCase();
+        const stateMessage = (extractXmlTag(liveXml, 'stateMessage') || '').toLowerCase();
+
+        const expectedCodeLower = tokenRecord.code.toLowerCase();
+        const rawPartLower = rawPart.toLowerCase();
+
+        let isMatch =
+          summary.includes(expectedCodeLower) ||
+          realname.includes(expectedCodeLower) ||
+          headline.includes(expectedCodeLower) ||
+          stateMessage.includes(expectedCodeLower) ||
+          (rawPartLower.length >= 4 &&
+            (summary.includes(rawPartLower) || realname.includes(rawPartLower) || headline.includes(rawPartLower))) ||
+          liveXml.toLowerCase().includes(expectedCodeLower);
+
+        if (!isMatch) {
+          const customUrl = extractXmlTag(liveXml, 'customURL');
+          if (customUrl) {
+            try {
+              const vanityResp = await fetch(
+                `https://steamcommunity.com/id/${encodeURIComponent(customUrl)}/?xml=1&_t=${Date.now()}`,
+                {
+                  headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) NovaBlast/1.0',
+                    Accept: 'application/xml,text/xml,*/*',
+                    'Cache-Control': 'no-cache, no-store',
+                  },
+                  signal: AbortSignal.timeout(8000),
+                }
+              );
+              if (vanityResp.ok) {
+                const vanityXml = await vanityResp.text();
+                const vSummary = (extractXmlTag(vanityXml, 'summary') || '').toLowerCase();
+                const vRealname = (extractXmlTag(vanityXml, 'realname') || '').toLowerCase();
+                isMatch =
+                  vSummary.includes(expectedCodeLower) ||
+                  vRealname.includes(expectedCodeLower) ||
+                  (rawPartLower.length >= 4 && (vSummary.includes(rawPartLower) || vRealname.includes(rawPartLower))) ||
+                  vanityXml.toLowerCase().includes(expectedCodeLower);
+              }
+            } catch {}
+          }
         }
-      );
-    } catch (err) {
-      console.error('[Steam Auth] QR poll error:', err);
-      sendJson(res, 500, { authenticated: false, error: 'Ошибка опроса сессии Steam QR.' });
+
+        if (!isMatch) {
+          sendJson(res, 400, {
+            authenticated: false,
+            error: `Код «${tokenRecord.code}» не найден в описании профиля («О себе»), настоящем имени или статусе Steam. Убедитесь, что изменения сохранены и профиль открыт.`,
+          });
+          return;
+        }
+
+        const freshProfile = await fetchSteamProfile(steamId);
+        const signedSession = signSessionPayload(freshProfile);
+        const customToken = createFirebaseCustomToken(`steam_${freshProfile.steamId}`, {
+          steamId: freshProfile.steamId,
+          provider: 'steam',
+          personaName: freshProfile.personaName,
+        });
+
+        sendJson(
+          res,
+          200,
+          {
+            authenticated: true,
+            steamProfile: freshProfile,
+            customToken,
+            sessionToken: signedSession,
+            firebaseCustomAuthReady: Boolean(customToken),
+          },
+          {
+            'Set-Cookie': buildSessionCookieHeader(signedSession, SESSION_MAX_AGE_SECONDS, httpsFlag),
+          }
+        );
+      } catch (err) {
+        console.error('[Steam Auth] Verification error:', err);
+        sendJson(res, 500, { authenticated: false, error: 'Ошибка проверки владения профилем Steam.' });
+      }
+      return;
     }
-    return;
-  }
 
-  // 4. Steam Poll (serverless stateless stub — real completion flows via localStorage/BroadcastChannel/postMessage from same-origin callback)
-  if (pathname.startsWith('/api/auth/steam/poll')) {
-    sendJson(res, 200, { status: 'pending' });
-    return;
-  }
+    // 11. GitHub OAuth 2.0 URL
+    if (pathname === '/api/auth/github/url' && method === 'GET') {
+      const clientId = (process.env.GITHUB_CLIENT_ID || process.env.CLIENT_ID || '').trim();
+      const rawLoginId = getQueryString(queryParams, 'loginId').trim();
+      const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId) ? rawLoginId : crypto.randomUUID();
+      const callbackUrl = `${baseUrl}/auth/github/callback`;
 
-  // 5. Steam OpenID Callback
-  if (pathname.startsWith('/auth/steam/callback') || pathname.startsWith('/api/auth/steam/callback')) {
-    const segs = pathname.split('/').filter(Boolean);
-    const maybeLoginId = segs[segs.length - 1] !== 'callback' ? segs[segs.length - 1] : '';
-    const rawLoginId = maybeLoginId || getQueryString(queryParams, 'loginId');
-    const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId.trim()) ? rawLoginId.trim() : '';
+      if (!clientId) {
+        sendJson(res, 200, {
+          configured: false,
+          error: 'GITHUB_CLIENT_ID is not configured',
+          callbackUrl,
+          loginId,
+        });
+        return;
+      }
 
-    try {
-      const mode = getQueryString(queryParams, 'openid.mode');
-      if (mode !== 'id_res') {
-        const cancelMsg = 'Вход через Steam был отменён.';
+      const params = new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: callbackUrl,
+        scope: 'read:user user:email',
+        state: loginId,
+      });
+
+      sendJson(res, 200, {
+        url: `https://github.com/login/oauth/authorize?${params.toString()}`,
+        callbackUrl,
+        loginId,
+        configured: true,
+      });
+      return;
+    }
+
+    // 12. GitHub Poll (stateless stub)
+    if (pathname.startsWith('/api/auth/github/poll')) {
+      sendJson(res, 200, { status: 'pending' });
+      return;
+    }
+
+    // 13. GitHub Callback
+    if (pathname.startsWith('/auth/github/callback') || pathname.startsWith('/api/auth/github/callback')) {
+      const segs = pathname.split('/').filter(Boolean);
+      const maybeLoginId = segs[segs.length - 1] !== 'callback' ? segs[segs.length - 1] : '';
+      const rawLoginId = maybeLoginId || getQueryString(queryParams, 'state') || getQueryString(queryParams, 'loginId');
+      const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId.trim()) ? rawLoginId.trim() : '';
+
+      const errorParam = getQueryString(queryParams, 'error');
+      if (errorParam) {
+        const cancelMsg = getQueryString(queryParams, 'error_description') || 'Вход через GitHub был отменён.';
         sendHtml(
           res,
           400,
           renderPopupCallbackHtml(
-            { type: 'STEAM_AUTH_ERROR', loginId, error: cancelMsg },
+            { type: 'GITHUB_AUTH_ERROR', loginId, error: cancelMsg },
             'Вход отменён',
             'Вы можете закрыть это окно и вернуться в NovaBlast.',
             false
@@ -887,847 +1312,398 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return;
       }
 
-      const isValid = await verifySteamOpenIdParams(queryParams);
-      if (!isValid) {
-        const invalidMsg = 'Не удалось подтвердить подпись ответа Steam OpenID.';
-        sendHtml(
-          res,
-          401,
-          renderPopupCallbackHtml(
-            { type: 'STEAM_AUTH_ERROR', loginId, error: invalidMsg },
-            'Ошибка проверки Steam',
-            'Подпись ответа не прошла валидацию. Закройте окно и попробуйте войти снова.',
-            false
-          )
-        );
-        return;
-      }
-
-      const claimedId = getQueryString(queryParams, 'openid.claimed_id');
-      const idMatch = claimedId.match(/^https?:\/\/steamcommunity\.com\/openid\/id\/(\d{17,25})$/);
-      if (!idMatch) {
-        const formatMsg = 'Некорректный формат идентификатора SteamID.';
+      const code = getQueryString(queryParams, 'code').trim();
+      if (!code) {
         sendHtml(
           res,
           400,
           renderPopupCallbackHtml(
-            { type: 'STEAM_AUTH_ERROR', loginId, error: formatMsg },
-            'Ошибка SteamID',
-            'Не удалось определить SteamID из ответа Steam.',
+            { type: 'GITHUB_AUTH_ERROR', loginId, error: 'Код авторизации не получен.' },
+            'Ошибка GitHub',
+            'Код авторизации не найден. Попробуйте войти снова.',
             false
           )
         );
         return;
       }
 
-      const steamId = idMatch[1];
-      const steamProfile = await fetchSteamProfile(steamId);
-      const signedSession = signSessionPayload(steamProfile);
+      const clientId = (process.env.GITHUB_CLIENT_ID || process.env.CLIENT_ID || '').trim();
+      const clientSecret = (process.env.GITHUB_CLIENT_SECRET || process.env.CLIENT_SECRET || '').trim();
 
-      let customToken: string | null = null;
-      const adminAuth = getFirebaseAdmin();
-      if (adminAuth) {
-        try {
-          customToken = await adminAuth.createCustomToken(`steam_${steamId}`, {
-            steamId,
-            provider: 'steam',
-            personaName: steamProfile.personaName,
-          });
-        } catch (tokenErr) {
-          console.error('[Steam Auth] Custom token error:', tokenErr);
-        }
+      if (!clientId || !clientSecret) {
+        const configError = 'GITHUB_CLIENT_ID или GITHUB_CLIENT_SECRET не настроены на сервере.';
+        sendHtml(
+          res,
+          500,
+          renderPopupCallbackHtml(
+            { type: 'GITHUB_AUTH_ERROR', loginId, error: configError },
+            'Ошибка конфигурации',
+            configError,
+            false
+          )
+        );
+        return;
       }
 
-      sendHtml(
-        res,
-        200,
-        renderPopupCallbackHtml(
-          {
-            type: 'STEAM_AUTH_SUCCESS',
-            loginId,
-            steamProfile,
-            customToken,
-            sessionToken: signedSession,
-            firebaseCustomAuthReady: Boolean(customToken),
-          },
-          `Привет, ${steamProfile.personaName}!`,
-          'Вход через Steam выполнен. Это окно автоматически закроется.',
-          true,
-          steamProfile.avatarUrl
-        ),
-        {
-          'Set-Cookie': buildSessionCookieHeader(signedSession, SESSION_MAX_AGE_SECONDS, httpsFlag),
-        }
-      );
-    } catch (err) {
-      console.error('[Steam Auth] Callback error:', err);
-      const errMsg = 'Внутренняя ошибка сервера при проверке входа Steam.';
-      sendHtml(
-        res,
-        500,
-        renderPopupCallbackHtml(
-          { type: 'STEAM_AUTH_ERROR', loginId, error: errMsg },
-          'Ошибка входа',
-          errMsg,
-          false
-        )
-      );
-    }
-    return;
-  }
-
-  // 6. Steam Manual Callback Recovery
-  if (pathname === '/api/auth/steam/manual-callback' && method === 'POST') {
-    const body = await readJsonBody(req);
-    const rawUrl = typeof body?.url === 'string' ? body.url.trim() : '';
-    if (!rawUrl) {
-      sendJson(res, 400, { authenticated: false, error: 'Вставьте ссылку из адресной строки окна с ошибкой.' });
-      return;
-    }
-
-    try {
-      let parsedUrl: URL;
       try {
-        parsedUrl = new URL(rawUrl);
-      } catch {
-        sendJson(res, 400, { authenticated: false, error: 'Некорректная ссылка. Скопируйте весь URL из адресной строки.' });
-        return;
-      }
-
-      if (parsedUrl.searchParams.get('openid.mode') !== 'id_res') {
-        sendJson(res, 400, { authenticated: false, error: 'В этой ссылке отсутствуют параметры ответа Steam (openid.mode=id_res).' });
-        return;
-      }
-
-      const isValid = await verifySteamOpenIdParams(parsedUrl.searchParams);
-      if (!isValid) {
-        sendJson(res, 401, { authenticated: false, error: 'Подпись ответа Steam OpenID недействительна или уже устарела.' });
-        return;
-      }
-
-      const claimedId = parsedUrl.searchParams.get('openid.claimed_id') || '';
-      const idMatch = claimedId.match(/^https?:\/\/steamcommunity\.com\/openid\/id\/(\d{17,25})$/);
-      if (!idMatch) {
-        sendJson(res, 400, { authenticated: false, error: 'Не удалось извлечь SteamID из ссылки.' });
-        return;
-      }
-
-      const steamId = idMatch[1];
-      const steamProfile = await fetchSteamProfile(steamId);
-      const signedSession = signSessionPayload(steamProfile);
-
-      let customToken: string | null = null;
-      const adminAuth = getFirebaseAdmin();
-      if (adminAuth) {
-        try {
-          customToken = await adminAuth.createCustomToken(`steam_${steamId}`, {
-            steamId,
-            provider: 'steam',
-            personaName: steamProfile.personaName,
-          });
-        } catch {}
-      }
-
-      sendJson(
-        res,
-        200,
-        {
-          authenticated: true,
-          steamProfile,
-          customToken,
-          sessionToken: signedSession,
-          firebaseCustomAuthReady: Boolean(customToken),
-        },
-        {
-          'Set-Cookie': buildSessionCookieHeader(signedSession, SESSION_MAX_AGE_SECONDS, httpsFlag),
-        }
-      );
-    } catch (err) {
-      console.error('[Steam Auth] Manual callback error:', err);
-      sendJson(res, 500, { authenticated: false, error: 'Внутренняя ошибка при обработке ссылки Steam.' });
-    }
-    return;
-  }
-
-  // 7. Steam Session Check
-  if (pathname === '/api/auth/steam/session' && method === 'GET') {
-    const profile = extractSessionProfile(req);
-    if (!profile) {
-      sendJson(res, 200, { authenticated: false });
-      return;
-    }
-
-    let customToken: string | null = null;
-    const adminAuth = getFirebaseAdmin();
-    if (adminAuth) {
-      try {
-        customToken = await adminAuth.createCustomToken(`steam_${profile.steamId}`, {
-          steamId: profile.steamId,
-          provider: 'steam',
-          personaName: profile.personaName,
-        });
-      } catch {}
-    }
-
-    sendJson(res, 200, {
-      authenticated: true,
-      steamProfile: profile,
-      customToken,
-      sessionToken: signSessionPayload(profile),
-      firebaseCustomAuthReady: Boolean(customToken),
-    });
-    return;
-  }
-
-  // 8. Steam Logout
-  if (pathname === '/api/auth/steam/logout' && method === 'POST') {
-    sendJson(
-      res,
-      200,
-      { ok: true },
-      {
-        'Set-Cookie': buildSessionCookieHeader('', 0, httpsFlag),
-      }
-    );
-    return;
-  }
-
-  // 9. Steam Profile Ownership Challenge (Stateless HMAC challengeToken)
-  if (pathname === '/api/auth/steam/challenge' && method === 'POST') {
-    const body = await readJsonBody(req);
-    const queryStr = typeof body?.query === 'string' ? body.query.trim() : '';
-    if (!queryStr) {
-      sendJson(res, 400, { success: false, error: 'Укажите никнейм, ссылку на профиль или SteamID.' });
-      return;
-    }
-
-    try {
-      const profile = await resolveSteamProfileInput(queryStr);
-      if (!profile) {
-        sendJson(res, 404, {
-          success: false,
-          error: 'Профиль Steam не найден. Убедитесь, что ник или ссылка верны, а профиль открыт для сообщества.',
-        });
-        return;
-      }
-
-      const randomHex = crypto.randomBytes(3).toString('hex').toUpperCase();
-      const challengeCode = `NOVA-${randomHex}`;
-      const expiresAt = Date.now() + CHALLENGE_TTL_MS;
-      const challengeToken = signTokenPayload(
-        { steamId: profile.steamId, code: challengeCode, expiresAt },
-        Math.ceil(CHALLENGE_TTL_MS / 1000)
-      );
-
-      sendJson(res, 200, {
-        success: true,
-        profile,
-        challengeCode,
-        challengeToken,
-        expiresAt,
-      });
-    } catch (err) {
-      console.error('[Steam Auth] Challenge error:', err);
-      sendJson(res, 500, { success: false, error: 'Ошибка сервера при поиске профиля Steam.' });
-    }
-    return;
-  }
-
-  // 10. Verify Steam Challenge
-  if (pathname === '/api/auth/steam/verify-challenge' && method === 'POST') {
-    const body = await readJsonBody(req);
-    const steamId = typeof body?.steamId === 'string' ? body.steamId.trim() : '';
-    const inputCode = typeof body?.challengeCode === 'string' ? body.challengeCode.trim() : '';
-    const challengeToken = typeof body?.challengeToken === 'string' ? body.challengeToken.trim() : '';
-
-    if (!steamId || !inputCode || !challengeToken) {
-      sendJson(res, 400, { authenticated: false, error: 'Не указан SteamID, токен или проверочный код.' });
-      return;
-    }
-
-    const tokenRecord = verifyTokenPayload<{ steamId: string; code: string; expiresAt: number }>(challengeToken);
-    if (!tokenRecord || tokenRecord.steamId !== steamId || Date.now() > tokenRecord.expiresAt) {
-      sendJson(res, 400, {
-        authenticated: false,
-        error: 'Срок действия кода проверки истек или запрос не найден. Запросите новый код.',
-      });
-      return;
-    }
-
-    const normExpected = tokenRecord.code.toUpperCase();
-    const normInput = inputCode.toUpperCase();
-    const rawPart = tokenRecord.code.split('-')[1] || '';
-    if (normInput !== normExpected && !normInput.endsWith(rawPart)) {
-      sendJson(res, 400, { authenticated: false, error: 'Введен неверный проверочный код.' });
-      return;
-    }
-
-    try {
-      let liveXml = '';
-      const xmlUrl = `https://steamcommunity.com/profiles/${encodeURIComponent(steamId)}/?xml=1&_t=${Date.now()}`;
-      try {
-        const xmlResp = await fetch(xmlUrl, {
+        const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
+          method: 'POST',
           headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) NovaBlast/1.0',
-            Accept: 'application/xml,text/xml,*/*',
-            'Cache-Control': 'no-cache, no-store',
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'User-Agent': 'NovaBlast-Pixel-Editor',
           },
-          signal: AbortSignal.timeout(8000),
+          body: JSON.stringify({
+            client_id: clientId,
+            client_secret: clientSecret,
+            code,
+          }),
+          signal: AbortSignal.timeout(10000),
         });
-        if (xmlResp.ok) {
-          liveXml = await xmlResp.text();
+
+        const tokenData = (await tokenResp.json()) as { access_token?: string; error?: string; error_description?: string };
+        if (!tokenResp.ok || !tokenData.access_token) {
+          throw new Error(tokenData.error_description || tokenData.error || 'Не удалось обменять код на токен.');
         }
-      } catch {}
 
-      const summary = (extractXmlTag(liveXml, 'summary') || '').toLowerCase();
-      const realname = (extractXmlTag(liveXml, 'realname') || '').toLowerCase();
-      const headline = (extractXmlTag(liveXml, 'headline') || '').toLowerCase();
-      const stateMessage = (extractXmlTag(liveXml, 'stateMessage') || '').toLowerCase();
+        const accessToken = tokenData.access_token;
+        const userResp = await fetch('https://api.github.com/user', {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: 'application/vnd.github.v3+json',
+            'User-Agent': 'NovaBlast-Pixel-Editor',
+          },
+          signal: AbortSignal.timeout(10000),
+        });
 
-      const expectedCodeLower = tokenRecord.code.toLowerCase();
-      const rawPartLower = rawPart.toLowerCase();
+        if (!userResp.ok) {
+          throw new Error(`Ошибка получения профиля GitHub: ${userResp.status}`);
+        }
 
-      let isMatch =
-        summary.includes(expectedCodeLower) ||
-        realname.includes(expectedCodeLower) ||
-        headline.includes(expectedCodeLower) ||
-        stateMessage.includes(expectedCodeLower) ||
-        (rawPartLower.length >= 4 &&
-          (summary.includes(rawPartLower) || realname.includes(rawPartLower) || headline.includes(rawPartLower))) ||
-        liveXml.toLowerCase().includes(expectedCodeLower);
+        const ghUser = (await userResp.json()) as {
+          id: number;
+          login: string;
+          name?: string;
+          avatar_url?: string;
+          html_url?: string;
+          email?: string;
+        };
 
-      if (!isMatch) {
-        const customUrl = extractXmlTag(liveXml, 'customURL');
-        if (customUrl) {
+        let primaryEmail = ghUser.email || '';
+        if (!primaryEmail) {
           try {
-            const vanityResp = await fetch(
-              `https://steamcommunity.com/id/${encodeURIComponent(customUrl)}/?xml=1&_t=${Date.now()}`,
-              {
-                headers: {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) NovaBlast/1.0',
-                  Accept: 'application/xml,text/xml,*/*',
-                  'Cache-Control': 'no-cache, no-store',
-                },
-                signal: AbortSignal.timeout(8000),
+            const emailResp = await fetch('https://api.github.com/user/emails', {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                Accept: 'application/vnd.github.v3+json',
+                'User-Agent': 'NovaBlast-Pixel-Editor',
+              },
+              signal: AbortSignal.timeout(5000),
+            });
+            if (emailResp.ok) {
+              const emails = (await emailResp.json()) as { email: string; primary?: boolean; verified?: boolean }[];
+              const primaryObj = emails.find((e) => e.primary && e.verified) || emails.find((e) => e.primary) || emails[0];
+              if (primaryObj?.email) {
+                primaryEmail = primaryObj.email;
               }
-            );
-            if (vanityResp.ok) {
-              const vanityXml = await vanityResp.text();
-              const vSummary = (extractXmlTag(vanityXml, 'summary') || '').toLowerCase();
-              const vRealname = (extractXmlTag(vanityXml, 'realname') || '').toLowerCase();
-              isMatch =
-                vSummary.includes(expectedCodeLower) ||
-                vRealname.includes(expectedCodeLower) ||
-                (rawPartLower.length >= 4 && (vSummary.includes(rawPartLower) || vRealname.includes(rawPartLower))) ||
-                vanityXml.toLowerCase().includes(expectedCodeLower);
             }
           } catch {}
         }
-      }
 
-      if (!isMatch) {
-        sendJson(res, 400, {
-          authenticated: false,
-          error: `Код «${tokenRecord.code}» не найден в описании профиля («О себе»), настоящем имени или статусе Steam. Убедитесь, что изменения сохранены и профиль открыт.`,
+        const githubProfile: GitHubUserProfile = {
+          githubId: String(ghUser.id),
+          login: ghUser.login,
+          name: ghUser.name || ghUser.login,
+          avatarUrl: ghUser.avatar_url || '',
+          profileUrl: ghUser.html_url || `https://github.com/${ghUser.login}`,
+          email: primaryEmail || undefined,
+        };
+
+        const customToken = createFirebaseCustomToken(`github_${githubProfile.githubId}`, {
+          provider: 'github',
+          githubId: githubProfile.githubId,
+          login: githubProfile.login,
+        });
+
+        const sessionToken = signSessionPayload({
+          steamId: `github_${githubProfile.githubId}`,
+          personaName: githubProfile.name,
+          avatarUrl: githubProfile.avatarUrl,
+          profileUrl: githubProfile.profileUrl,
+        });
+
+        sendHtml(
+          res,
+          200,
+          renderPopupCallbackHtml(
+            {
+              type: 'GITHUB_AUTH_SUCCESS',
+              loginId,
+              githubProfile,
+              customToken,
+              sessionToken,
+              firebaseCustomAuthReady: Boolean(customToken),
+            },
+            `Добро пожаловать, ${githubProfile.name}!`,
+            'Авторизация через GitHub успешно завершена. Окно сейчас закроется.',
+            true,
+            githubProfile.avatarUrl
+          )
+        );
+      } catch (err: any) {
+        console.error('[GitHub Auth] Callback error:', err);
+        const errMsg = err?.message || 'Внутренняя ошибка при входе через GitHub.';
+        sendHtml(
+          res,
+          500,
+          renderPopupCallbackHtml(
+            { type: 'GITHUB_AUTH_ERROR', loginId, error: errMsg },
+            'Ошибка авторизации',
+            errMsg,
+            false
+          )
+        );
+      }
+      return;
+    }
+
+    // 14. X (Twitter) OAuth 2.0 URL
+    if (pathname === '/api/auth/x/url' && method === 'GET') {
+      const clientId = (process.env.X_CLIENT_ID || process.env.TWITTER_CLIENT_ID || '').trim();
+      const rawLoginId = getQueryString(queryParams, 'loginId').trim();
+      const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId) ? rawLoginId : crypto.randomUUID();
+      const callbackUrl = `${baseUrl}/auth/x/callback`;
+
+      if (!clientId) {
+        sendJson(res, 200, {
+          configured: false,
+          error: 'X_CLIENT_ID is not configured',
+          callbackUrl,
+          loginId,
         });
         return;
       }
 
-      const freshProfile = await fetchSteamProfile(steamId);
-      const signedSession = signSessionPayload(freshProfile);
+      const params = new URLSearchParams({
+        response_type: 'code',
+        client_id: clientId,
+        redirect_uri: callbackUrl,
+        scope: 'tweet.read users.read offline.access',
+        state: loginId,
+        code_challenge: 'challenge',
+        code_challenge_method: 'plain',
+      });
 
-      let customToken: string | null = null;
-      const adminAuth = getFirebaseAdmin();
-      if (adminAuth) {
-        try {
-          customToken = await adminAuth.createCustomToken(`steam_${freshProfile.steamId}`, {
-            steamId: freshProfile.steamId,
-            provider: 'steam',
-            personaName: freshProfile.personaName,
-          });
-        } catch {}
-      }
-
-      sendJson(
-        res,
-        200,
-        {
-          authenticated: true,
-          steamProfile: freshProfile,
-          customToken,
-          sessionToken: signedSession,
-          firebaseCustomAuthReady: Boolean(customToken),
-        },
-        {
-          'Set-Cookie': buildSessionCookieHeader(signedSession, SESSION_MAX_AGE_SECONDS, httpsFlag),
-        }
-      );
-    } catch (err) {
-      console.error('[Steam Auth] Verification error:', err);
-      sendJson(res, 500, { authenticated: false, error: 'Ошибка проверки владения профилем Steam.' });
-    }
-    return;
-  }
-
-  // 11. GitHub OAuth 2.0 URL
-  if (pathname === '/api/auth/github/url' && method === 'GET') {
-    const clientId = (process.env.GITHUB_CLIENT_ID || process.env.CLIENT_ID || '').trim();
-    const rawLoginId = getQueryString(queryParams, 'loginId').trim();
-    const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId) ? rawLoginId : crypto.randomUUID();
-    const callbackUrl = `${baseUrl}/auth/github/callback`;
-
-    if (!clientId) {
       sendJson(res, 200, {
-        configured: false,
-        error: 'GITHUB_CLIENT_ID is not configured',
+        url: `https://twitter.com/i/oauth2/authorize?${params.toString()}`,
         callbackUrl,
         loginId,
+        configured: true,
       });
       return;
     }
 
-    const params = new URLSearchParams({
-      client_id: clientId,
-      redirect_uri: callbackUrl,
-      scope: 'read:user user:email',
-      state: loginId,
-    });
-
-    sendJson(res, 200, {
-      url: `https://github.com/login/oauth/authorize?${params.toString()}`,
-      callbackUrl,
-      loginId,
-      configured: true,
-    });
-    return;
-  }
-
-  // 12. GitHub Poll (stateless stub)
-  if (pathname.startsWith('/api/auth/github/poll')) {
-    sendJson(res, 200, { status: 'pending' });
-    return;
-  }
-
-  // 13. GitHub Callback
-  if (pathname.startsWith('/auth/github/callback') || pathname.startsWith('/api/auth/github/callback')) {
-    const segs = pathname.split('/').filter(Boolean);
-    const maybeLoginId = segs[segs.length - 1] !== 'callback' ? segs[segs.length - 1] : '';
-    const rawLoginId = maybeLoginId || getQueryString(queryParams, 'state') || getQueryString(queryParams, 'loginId');
-    const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId.trim()) ? rawLoginId.trim() : '';
-
-    const errorParam = getQueryString(queryParams, 'error');
-    if (errorParam) {
-      const cancelMsg = getQueryString(queryParams, 'error_description') || 'Вход через GitHub был отменён.';
-      sendHtml(
-        res,
-        400,
-        renderPopupCallbackHtml(
-          { type: 'GITHUB_AUTH_ERROR', loginId, error: cancelMsg },
-          'Вход отменён',
-          'Вы можете закрыть это окно и вернуться в NovaBlast.',
-          false
-        )
-      );
+    // 15. X Poll (stateless stub)
+    if (pathname.startsWith('/api/auth/x/poll')) {
+      sendJson(res, 200, { status: 'pending' });
       return;
     }
 
-    const code = getQueryString(queryParams, 'code').trim();
-    if (!code) {
-      sendHtml(
-        res,
-        400,
-        renderPopupCallbackHtml(
-          { type: 'GITHUB_AUTH_ERROR', loginId, error: 'Код авторизации не получен.' },
-          'Ошибка GitHub',
-          'Код авторизации не найден. Попробуйте войти снова.',
-          false
-        )
-      );
-      return;
-    }
+    // 16. X Callback
+    if (pathname.startsWith('/auth/x/callback') || pathname.startsWith('/api/auth/x/callback')) {
+      const segs = pathname.split('/').filter(Boolean);
+      const maybeLoginId = segs[segs.length - 1] !== 'callback' ? segs[segs.length - 1] : '';
+      const rawLoginId = maybeLoginId || getQueryString(queryParams, 'state') || getQueryString(queryParams, 'loginId');
+      const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId.trim()) ? rawLoginId.trim() : '';
 
-    const clientId = (process.env.GITHUB_CLIENT_ID || process.env.CLIENT_ID || '').trim();
-    const clientSecret = (process.env.GITHUB_CLIENT_SECRET || process.env.CLIENT_SECRET || '').trim();
-
-    if (!clientId || !clientSecret) {
-      const configError = 'GITHUB_CLIENT_ID или GITHUB_CLIENT_SECRET не настроены на сервере.';
-      sendHtml(
-        res,
-        500,
-        renderPopupCallbackHtml(
-          { type: 'GITHUB_AUTH_ERROR', loginId, error: configError },
-          'Ошибка конфигурации',
-          configError,
-          false
-        )
-      );
-      return;
-    }
-
-    try {
-      const tokenResp = await fetch('https://github.com/login/oauth/access_token', {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'User-Agent': 'NovaBlast-Pixel-Editor',
-        },
-        body: JSON.stringify({
-          client_id: clientId,
-          client_secret: clientSecret,
-          code,
-        }),
-        signal: AbortSignal.timeout(10000),
-      });
-
-      const tokenData = (await tokenResp.json()) as { access_token?: string; error?: string; error_description?: string };
-      if (!tokenResp.ok || !tokenData.access_token) {
-        throw new Error(tokenData.error_description || tokenData.error || 'Не удалось обменять код на токен.');
-      }
-
-      const accessToken = tokenData.access_token;
-      const userResp = await fetch('https://api.github.com/user', {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/vnd.github.v3+json',
-          'User-Agent': 'NovaBlast-Pixel-Editor',
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-
-      if (!userResp.ok) {
-        throw new Error(`Ошибка получения профиля GitHub: ${userResp.status}`);
-      }
-
-      const ghUser = (await userResp.json()) as {
-        id: number;
-        login: string;
-        name?: string;
-        avatar_url?: string;
-        html_url?: string;
-        email?: string;
-      };
-
-      let primaryEmail = ghUser.email || '';
-      if (!primaryEmail) {
-        try {
-          const emailResp = await fetch('https://api.github.com/user/emails', {
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              Accept: 'application/vnd.github.v3+json',
-              'User-Agent': 'NovaBlast-Pixel-Editor',
-            },
-            signal: AbortSignal.timeout(5000),
-          });
-          if (emailResp.ok) {
-            const emails = (await emailResp.json()) as { email: string; primary?: boolean; verified?: boolean }[];
-            const primaryObj = emails.find((e) => e.primary && e.verified) || emails.find((e) => e.primary) || emails[0];
-            if (primaryObj?.email) {
-              primaryEmail = primaryObj.email;
-            }
-          }
-        } catch {}
-      }
-
-      const githubProfile: GitHubUserProfile = {
-        githubId: String(ghUser.id),
-        login: ghUser.login,
-        name: ghUser.name || ghUser.login,
-        avatarUrl: ghUser.avatar_url || '',
-        profileUrl: ghUser.html_url || `https://github.com/${ghUser.login}`,
-        email: primaryEmail || undefined,
-      };
-
-      let customToken: string | null = null;
-      const admin = getFirebaseAdmin();
-      if (admin) {
-        try {
-          customToken = await admin.createCustomToken(`github_${githubProfile.githubId}`, {
-            provider: 'github',
-            githubId: githubProfile.githubId,
-            login: githubProfile.login,
-          });
-        } catch {}
-      }
-
-      const sessionToken = signSessionPayload({
-        steamId: `github_${githubProfile.githubId}`,
-        personaName: githubProfile.name,
-        avatarUrl: githubProfile.avatarUrl,
-        profileUrl: githubProfile.profileUrl,
-      });
-
-      sendHtml(
-        res,
-        200,
-        renderPopupCallbackHtml(
-          {
-            type: 'GITHUB_AUTH_SUCCESS',
-            loginId,
-            githubProfile,
-            customToken,
-            sessionToken,
-            firebaseCustomAuthReady: Boolean(customToken),
-          },
-          `Добро пожаловать, ${githubProfile.name}!`,
-          'Авторизация через GitHub успешно завершена. Окно сейчас закроется.',
-          true,
-          githubProfile.avatarUrl
-        )
-      );
-    } catch (err: any) {
-      console.error('[GitHub Auth] Callback error:', err);
-      const errMsg = err?.message || 'Внутренняя ошибка при входе через GitHub.';
-      sendHtml(
-        res,
-        500,
-        renderPopupCallbackHtml(
-          { type: 'GITHUB_AUTH_ERROR', loginId, error: errMsg },
-          'Ошибка авторизации',
-          errMsg,
-          false
-        )
-      );
-    }
-    return;
-  }
-
-  // 14. X (Twitter) OAuth 2.0 URL
-  if (pathname === '/api/auth/x/url' && method === 'GET') {
-    const clientId = (process.env.X_CLIENT_ID || process.env.TWITTER_CLIENT_ID || '').trim();
-    const rawLoginId = getQueryString(queryParams, 'loginId').trim();
-    const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId) ? rawLoginId : crypto.randomUUID();
-    const callbackUrl = `${baseUrl}/auth/x/callback`;
-
-    if (!clientId) {
-      sendJson(res, 200, {
-        configured: false,
-        error: 'X_CLIENT_ID is not configured',
-        callbackUrl,
-        loginId,
-      });
-      return;
-    }
-
-    const params = new URLSearchParams({
-      response_type: 'code',
-      client_id: clientId,
-      redirect_uri: callbackUrl,
-      scope: 'tweet.read users.read offline.access',
-      state: loginId,
-      code_challenge: 'challenge',
-      code_challenge_method: 'plain',
-    });
-
-    sendJson(res, 200, {
-      url: `https://twitter.com/i/oauth2/authorize?${params.toString()}`,
-      callbackUrl,
-      loginId,
-      configured: true,
-    });
-    return;
-  }
-
-  // 15. X Poll (stateless stub)
-  if (pathname.startsWith('/api/auth/x/poll')) {
-    sendJson(res, 200, { status: 'pending' });
-    return;
-  }
-
-  // 16. X Callback
-  if (pathname.startsWith('/auth/x/callback') || pathname.startsWith('/api/auth/x/callback')) {
-    const segs = pathname.split('/').filter(Boolean);
-    const maybeLoginId = segs[segs.length - 1] !== 'callback' ? segs[segs.length - 1] : '';
-    const rawLoginId = maybeLoginId || getQueryString(queryParams, 'state') || getQueryString(queryParams, 'loginId');
-    const loginId = /^[a-zA-Z0-9_-]{8,80}$/.test(rawLoginId.trim()) ? rawLoginId.trim() : '';
-
-    const errorParam = getQueryString(queryParams, 'error');
-    if (errorParam) {
-      const cancelMsg = getQueryString(queryParams, 'error_description') || 'Вход через X был отменён.';
-      sendHtml(
-        res,
-        400,
-        renderPopupCallbackHtml(
-          { type: 'X_AUTH_ERROR', loginId, error: cancelMsg },
-          'Вход отменён',
-          'Вы можете закрыть это окно и вернуться в NovaBlast.',
-          false
-        )
-      );
-      return;
-    }
-
-    const code = getQueryString(queryParams, 'code').trim();
-    if (!code) {
-      sendHtml(
-        res,
-        400,
-        renderPopupCallbackHtml(
-          { type: 'X_AUTH_ERROR', loginId, error: 'Код авторизации не получен.' },
-          'Ошибка X',
-          'Код авторизации не найден. Попробуйте войти снова.',
-          false
-        )
-      );
-      return;
-    }
-
-    const clientId = (process.env.X_CLIENT_ID || process.env.TWITTER_CLIENT_ID || '').trim();
-    const clientSecret = (process.env.X_CLIENT_SECRET || process.env.TWITTER_CLIENT_SECRET || '').trim();
-    const callbackUrl = `${baseUrl}/auth/x/callback`;
-
-    if (!clientId) {
-      const configError = 'X_CLIENT_ID не настроен на сервере.';
-      sendHtml(
-        res,
-        500,
-        renderPopupCallbackHtml(
-          { type: 'X_AUTH_ERROR', loginId, error: configError },
-          'Ошибка конфигурации',
-          configError,
-          false
-        )
-      );
-      return;
-    }
-
-    try {
-      const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-      const tokenResp = await fetch('https://api.twitter.com/2/oauth2/token', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          ...(clientSecret ? { Authorization: `Basic ${credentials}` } : {}),
-        },
-        body: new URLSearchParams({
-          grant_type: 'authorization_code',
-          code,
-          redirect_uri: callbackUrl,
-          code_verifier: 'challenge',
-        }),
-        signal: AbortSignal.timeout(10000),
-      });
-
-      const tokenData = (await tokenResp.json()) as { access_token?: string; error?: string; error_description?: string };
-      if (!tokenResp.ok || !tokenData.access_token) {
-        throw new Error(tokenData.error_description || tokenData.error || 'Не удалось обменять код X на токен.');
-      }
-
-      const accessToken = tokenData.access_token;
-      const userResp = await fetch('https://api.twitter.com/2/users/me?user.fields=profile_image_url,username,name', {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-
-      if (!userResp.ok) {
-        throw new Error(`Ошибка получения профиля X: ${userResp.status}`);
-      }
-
-      const userData = (await userResp.json()) as {
-        data?: {
-          id: string;
-          name: string;
-          username: string;
-          profile_image_url?: string;
-        };
-      };
-
-      const xUser = userData.data;
-      if (!xUser) {
-        throw new Error('Не удалось получить данные пользователя из X.');
-      }
-
-      const xProfile: XUserProfile = {
-        xId: String(xUser.id),
-        username: xUser.username,
-        name: xUser.name || xUser.username,
-        avatarUrl: xUser.profile_image_url || '',
-        profileUrl: `https://twitter.com/${xUser.username}`,
-      };
-
-      let customToken: string | null = null;
-      const admin = getFirebaseAdmin();
-      if (admin) {
-        try {
-          customToken = await admin.createCustomToken(`x_${xProfile.xId}`, {
-            provider: 'x',
-            xId: xProfile.xId,
-            username: xProfile.username,
-          });
-        } catch {}
-      }
-
-      const sessionToken = signSessionPayload({
-        steamId: `x_${xProfile.xId}`,
-        personaName: xProfile.name,
-        avatarUrl: xProfile.avatarUrl,
-        profileUrl: xProfile.profileUrl,
-      });
-
-      sendHtml(
-        res,
-        200,
-        renderPopupCallbackHtml(
-          {
-            type: 'X_AUTH_SUCCESS',
-            loginId,
-            xProfile,
-            customToken,
-            sessionToken,
-            firebaseCustomAuthReady: Boolean(customToken),
-          },
-          `Добро пожаловать, ${xProfile.name}!`,
-          'Авторизация через X успешно завершена. Окно сейчас закроется.',
-          true,
-          xProfile.avatarUrl
-        )
-      );
-    } catch (err: any) {
-      console.error('[X Auth] Callback error:', err);
-      const errMsg = err?.message || 'Внутренняя ошибка при входе через X.';
-      sendHtml(
-        res,
-        500,
-        renderPopupCallbackHtml(
-          { type: 'X_AUTH_ERROR', loginId, error: errMsg },
-          'Ошибка авторизации',
-          errMsg,
-          false
-        )
-      );
-    }
-    return;
-  }
-
-  // 17. AI Moderation Inspect
-  if (pathname === '/api/moderation/inspect' && method === 'POST') {
-    try {
-      const body = await readJsonBody(req);
-      const { image, title, description } = body || {};
-
-      if (!image || typeof image !== 'string') {
-        sendJson(res, 400, { allowed: false, reason: 'Отсутствуют данные изображения.' });
+      const errorParam = getQueryString(queryParams, 'error');
+      if (errorParam) {
+        const cancelMsg = getQueryString(queryParams, 'error_description') || 'Вход через X был отменён.';
+        sendHtml(
+          res,
+          400,
+          renderPopupCallbackHtml(
+            { type: 'X_AUTH_ERROR', loginId, error: cancelMsg },
+            'Вход отменён',
+            'Вы можете закрыть это окно и вернуться в NovaBlast.',
+            false
+          )
+        );
         return;
       }
 
-      if (process.env.GEMINI_API_KEY) {
-        try {
-          const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-          const cleanBase64 = image.replace(/^data:image\/\w+;base64,/, '').trim();
-          const response = await ai.models.generateContent({
-            model: 'gemini-3.8-flash',
-            contents: {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: 'image/png',
-                    data: cleanBase64,
-                  },
-                },
-                {
-                  text: `Analyze this pixel art image and metadata for a public family-friendly pixel art gallery.
+      const code = getQueryString(queryParams, 'code').trim();
+      if (!code) {
+        sendHtml(
+          res,
+          400,
+          renderPopupCallbackHtml(
+            { type: 'X_AUTH_ERROR', loginId, error: 'Код авторизации не получен.' },
+            'Ошибка X',
+            'Код авторизации не найден. Попробуйте войти снова.',
+            false
+          )
+        );
+        return;
+      }
+
+      const clientId = (process.env.X_CLIENT_ID || process.env.TWITTER_CLIENT_ID || '').trim();
+      const clientSecret = (process.env.X_CLIENT_SECRET || process.env.TWITTER_CLIENT_SECRET || '').trim();
+      const callbackUrl = `${baseUrl}/auth/x/callback`;
+
+      if (!clientId) {
+        const configError = 'X_CLIENT_ID не настроен на сервере.';
+        sendHtml(
+          res,
+          500,
+          renderPopupCallbackHtml(
+            { type: 'X_AUTH_ERROR', loginId, error: configError },
+            'Ошибка конфигурации',
+            configError,
+            false
+          )
+        );
+        return;
+      }
+
+      try {
+        const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+        const tokenResp = await fetch('https://api.twitter.com/2/oauth2/token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            ...(clientSecret ? { Authorization: `Basic ${credentials}` } : {}),
+          },
+          body: new URLSearchParams({
+            grant_type: 'authorization_code',
+            code,
+            redirect_uri: callbackUrl,
+            code_verifier: 'challenge',
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+
+        const tokenData = (await tokenResp.json()) as { access_token?: string; error?: string; error_description?: string };
+        if (!tokenResp.ok || !tokenData.access_token) {
+          throw new Error(tokenData.error_description || tokenData.error || 'Не удалось обменять код X на токен.');
+        }
+
+        const accessToken = tokenData.access_token;
+        const userResp = await fetch('https://api.twitter.com/2/users/me?user.fields=profile_image_url,username,name', {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+          signal: AbortSignal.timeout(10000),
+        });
+
+        if (!userResp.ok) {
+          throw new Error(`Ошибка получения профиля X: ${userResp.status}`);
+        }
+
+        const userData = (await userResp.json()) as {
+          data?: {
+            id: string;
+            name: string;
+            username: string;
+            profile_image_url?: string;
+          };
+        };
+
+        const xUser = userData.data;
+        if (!xUser) {
+          throw new Error('Не удалось получить данные пользователя из X.');
+        }
+
+        const xProfile: XUserProfile = {
+          xId: String(xUser.id),
+          username: xUser.username,
+          name: xUser.name || xUser.username,
+          avatarUrl: xUser.profile_image_url || '',
+          profileUrl: `https://twitter.com/${xUser.username}`,
+        };
+
+        const customToken = createFirebaseCustomToken(`x_${xProfile.xId}`, {
+          provider: 'x',
+          xId: xProfile.xId,
+          username: xProfile.username,
+        });
+
+        const sessionToken = signSessionPayload({
+          steamId: `x_${xProfile.xId}`,
+          personaName: xProfile.name,
+          avatarUrl: xProfile.avatarUrl,
+          profileUrl: xProfile.profileUrl,
+        });
+
+        sendHtml(
+          res,
+          200,
+          renderPopupCallbackHtml(
+            {
+              type: 'X_AUTH_SUCCESS',
+              loginId,
+              xProfile,
+              customToken,
+              sessionToken,
+              firebaseCustomAuthReady: Boolean(customToken),
+            },
+            `Добро пожаловать, ${xProfile.name}!`,
+            'Авторизация через X успешно завершена. Окно сейчас закроется.',
+            true,
+            xProfile.avatarUrl
+          )
+        );
+      } catch (err: any) {
+        console.error('[X Auth] Callback error:', err);
+        const errMsg = err?.message || 'Внутренняя ошибка при входе через X.';
+        sendHtml(
+          res,
+          500,
+          renderPopupCallbackHtml(
+            { type: 'X_AUTH_ERROR', loginId, error: errMsg },
+            'Ошибка авторизации',
+            errMsg,
+            false
+          )
+        );
+      }
+      return;
+    }
+
+    // 17. AI Moderation Inspect (via Gemini REST API — zero external SDK dependencies)
+    if (pathname === '/api/moderation/inspect' && method === 'POST') {
+      try {
+        const body = await readJsonBody(req);
+        const { image, title, description } = body || {};
+
+        if (!image || typeof image !== 'string') {
+          sendJson(res, 400, { allowed: false, reason: 'Отсутствуют данные изображения.' });
+          return;
+        }
+
+        const apiKey = process.env.GEMINI_API_KEY?.trim();
+        if (apiKey) {
+          try {
+            const cleanBase64 = image.replace(/^data:image\/\w+;base64,/, '').trim();
+            const geminiResp = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(
+                apiKey
+              )}`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  contents: [
+                    {
+                      parts: [
+                        {
+                          inlineData: {
+                            mimeType: 'image/png',
+                            data: cleanBase64,
+                          },
+                        },
+                        {
+                          text: `Analyze this pixel art image and metadata for a public family-friendly pixel art gallery.
 Title: "${String(title || '').slice(0, 100)}"
 Description: "${String(description || '').slice(0, 500)}"
 
@@ -1738,35 +1714,48 @@ Inspect the drawing carefully for any inappropriate content, including:
 Strict requirement: If the image depicts NSFW, genitalia, or explicit illegal content, respond with {"safe": false, "reason": "Обнаружено недопустимое или непристойное содержимое."}.
 If the image is clean pixel art (characters, items, landscapes, potions, retro art, etc.), respond with {"safe": true, "reason": "OK"}.
 Return STRICT JSON ONLY.`,
-                },
-              ],
-            },
-            config: {
-              responseMimeType: 'application/json',
-            },
-          });
+                        },
+                      ],
+                    },
+                  ],
+                  generationConfig: {
+                    responseMimeType: 'application/json',
+                  },
+                }),
+                signal: AbortSignal.timeout(10000),
+              }
+            );
 
-          const jsonText = (response.text || '{}').trim();
-          const result = JSON.parse(jsonText);
-          if (result.safe === false) {
-            sendJson(res, 200, {
-              allowed: false,
-              reason: result.reason || 'Работа не прошла проверку модерации безопасности AI.',
-            });
-            return;
+            if (geminiResp.ok) {
+              const geminiData = (await geminiResp.json()) as {
+                candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+              };
+              const jsonText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '{}';
+              const result = JSON.parse(jsonText);
+              if (result.safe === false) {
+                sendJson(res, 200, {
+                  allowed: false,
+                  reason: result.reason || 'Работа не прошла проверку модерации безопасности AI.',
+                });
+                return;
+              }
+            }
+          } catch (aiErr) {
+            console.error('[AI Moderation] Gemini inspection error:', aiErr);
           }
-        } catch (aiErr) {
-          console.error('[AI Moderation] Gemini inspection error:', aiErr);
         }
+
+        sendJson(res, 200, { allowed: true });
+      } catch (err) {
+        console.error('[AI Moderation] Handler error:', err);
+        sendJson(res, 500, { allowed: false, reason: 'Ошибка проверки безопасности.' });
       }
-
-      sendJson(res, 200, { allowed: true });
-    } catch (err) {
-      console.error('[AI Moderation] Handler error:', err);
-      sendJson(res, 500, { allowed: false, reason: 'Ошибка проверки безопасности.' });
+      return;
     }
-    return;
-  }
 
-  sendJson(res, 404, { error: 'Not found', path: pathname });
+    sendJson(res, 404, { error: 'Not found', path: pathname });
+  } catch (fatalErr: any) {
+    console.error('[Vercel Router] Unhandled error:', fatalErr);
+    sendJson(res, 500, { error: fatalErr?.message || 'Internal server error' });
+  }
 }
