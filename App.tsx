@@ -852,10 +852,15 @@ const App: React.FC = () => {
     }
   }, [language, stopXPolling]);
 
-  // Restore verified Steam server session on startup (works via Bearer token even if 3P cookies are blocked)
-  useEffect(() => {
-    if (!isAuthReady || user) return;
+  const authEpochRef = useRef(0);
+  const hasAttemptedSteamRestoreRef = useRef(false);
 
+  // Restore verified Steam server session once on startup (works via Bearer token even if 3P cookies are blocked)
+  useEffect(() => {
+    if (!isAuthReady || user || hasAttemptedSteamRestoreRef.current) return;
+    hasAttemptedSteamRestoreRef.current = true;
+
+    const restoreEpoch = authEpochRef.current;
     let cancelled = false;
     const restoreSteamSession = async () => {
       try {
@@ -875,8 +880,9 @@ const App: React.FC = () => {
           cache: 'no-store',
         });
         if (!resp.ok) return;
+        if (cancelled || restoreEpoch !== authEpochRef.current) return;
         const data = await resp.json();
-        if (!cancelled && data?.authenticated && data?.steamProfile) {
+        if (!cancelled && restoreEpoch === authEpochRef.current && data?.authenticated && data?.steamProfile) {
           await completeSteamAuth(
             data.customToken || null,
             data.steamProfile,
@@ -904,6 +910,13 @@ const App: React.FC = () => {
     const processAuthPayload = async (payload: any) => {
       if (!payload || typeof payload !== 'object') return;
       const loginKey = payload.loginId || `msg_${payload.steamProfile?.steamId || ''}`;
+
+      try {
+        localStorage.removeItem('novablast_oauth_bridge');
+        if (payload.loginId) {
+          localStorage.removeItem(`novablast_oauth_bridge_${payload.loginId}`);
+        }
+      } catch {}
 
       if (payload.type === 'STEAM_AUTH_SUCCESS' && payload.steamProfile) {
         if (loginKey && completedSteamLoginsRef.current.has(loginKey)) return;
@@ -1653,24 +1666,44 @@ const App: React.FC = () => {
   };
 
   const handleLogout = async () => {
+    authEpochRef.current += 1;
+    hasAttemptedSteamRestoreRef.current = true;
+
+    handleCancelSteamLogin(undefined, false);
+    handleCancelGithubLogin(undefined, false);
+    handleCancelXLogin(undefined, false);
+
+    // Clear all local UI/account state synchronously first so logout is immediate and cannot be blocked by network errors
+    setSteamSessionUser(null);
+    setGithubSessionUser(null);
+    setXSessionUser(null);
+    setUser(null);
+    setSavedProjects([]);
+    setCurrentProjectId(null);
+    setProjectStarted(false);
+
     try {
-      handleCancelSteamLogin(undefined, false);
-      handleCancelGithubLogin(undefined, false);
-      handleCancelXLogin(undefined, false);
-      await signOut(auth);
-      setSteamSessionUser(null);
-      setGithubSessionUser(null);
-      setXSessionUser(null);
-      try {
-        localStorage.removeItem('novablast_steam_token');
-        localStorage.removeItem('novablast_github_token');
-        localStorage.removeItem('novablast_x_token');
-      } catch {}
-      await fetch('/api/auth/steam/logout', { method: 'POST', credentials: 'include' }).catch(() => {});
-      setProjectStarted(false);
-    } catch (error) {
-      console.error("Logout failed:", error);
-    }
+      localStorage.removeItem('novablast_steam_token');
+      localStorage.removeItem('novablast_github_token');
+      localStorage.removeItem('novablast_x_token');
+      localStorage.removeItem('novablast_oauth_bridge');
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('novablast_oauth_bridge_')) {
+          localStorage.removeItem(key);
+        }
+      }
+    } catch {}
+
+    await Promise.allSettled([
+      fetch('/api/auth/steam/logout', {
+        method: 'POST',
+        credentials: 'include',
+        keepalive: true,
+        cache: 'no-store',
+      }),
+      signOut(auth),
+    ]);
   };
 
   // Silent user project pre-fetcher to keep savedProjects updated without opening modals

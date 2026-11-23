@@ -1342,6 +1342,12 @@ async function startServer() {
       partitioned: isHttps,
       path: '/',
     });
+    res.clearCookie(SESSION_COOKIE_NAME, {
+      httpOnly: true,
+      secure: isHttps,
+      sameSite: isHttps ? 'none' : 'lax',
+      path: '/',
+    });
     res.json({ ok: true });
   });
 

@@ -294,6 +294,21 @@ function buildSessionCookieHeader(value: string, maxAgeSeconds: number, isHttps:
   return parts.join('; ');
 }
 
+function buildClearSessionCookieHeaders(isHttps: boolean): string[] {
+  const expired = 'Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT';
+  const headers = [
+    `${SESSION_COOKIE_NAME}=; Path=/; ${expired}; HttpOnly; SameSite=Lax`,
+  ];
+  if (isHttps) {
+    headers.push(
+      `${SESSION_COOKIE_NAME}=; Path=/; ${expired}; HttpOnly; SameSite=None; Secure`,
+      `${SESSION_COOKIE_NAME}=; Path=/; ${expired}; HttpOnly; SameSite=None; Secure; Partitioned`,
+      `${SESSION_COOKIE_NAME}=; Path=/; ${expired}; HttpOnly; SameSite=Lax; Secure`
+    );
+  }
+  return headers;
+}
+
 function isRequestHttps(req: VercelRequest): boolean {
   const forwardedProto = req.headers['x-forwarded-proto'];
   return (
@@ -1068,13 +1083,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // 8. Steam Logout
-    if (pathname === '/api/auth/steam/logout' && method === 'POST') {
+    if (pathname === '/api/auth/steam/logout' && (method === 'POST' || method === 'GET')) {
       sendJson(
         res,
         200,
         { ok: true },
         {
-          'Set-Cookie': buildSessionCookieHeader('', 0, httpsFlag),
+          'Set-Cookie': buildClearSessionCookieHeaders(httpsFlag),
         }
       );
       return;
