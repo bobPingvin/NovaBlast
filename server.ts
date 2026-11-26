@@ -1631,6 +1631,8 @@ async function startServer() {
       redirect_uri: callbackUrl,
       scope: 'read:user user:email',
       state: loginId,
+      prompt: 'select_account',
+      allow_signup: 'true',
     });
 
     const url = `https://github.com/login/oauth/authorize?${params.toString()}`;

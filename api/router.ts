@@ -1356,6 +1356,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         redirect_uri: callbackUrl,
         scope: 'read:user user:email',
         state: loginId,
+        prompt: 'select_account',
+        allow_signup: 'true',
       });
 
       sendJson(res, 200, {
